@@ -1,8 +1,13 @@
-# Stockpile Memory
+# Cast Memory
 
-Decoupled long-term memory for SillyTavern (Marinara-style).
+Long-term memory and character persistence for SillyTavern.
 
-## How it works
+This is the merged edition of Stockpile Memory. The summary engine below
+is inherited unchanged; a character vault with its own storage and
+controlled injection will be added on top of it. The original
+Stockpile Memory repository stays frozen at v1.1.1.
+
+## How the summary engine works
 
 1. **Stockpile** — After each reply, a few old turns are summarized in the
    background and stockpiled. The prompt is *not* touched, so the prompt
