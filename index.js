@@ -1,41 +1,46 @@
 /**
- * Stockpile Memory — decoupled long-term memory for SillyTavern.
+ * Cast Memory — long-term memory + character persistence for SillyTavern.
  *
- * Design (Marinara-style, decoupled):
- *  - Summaries are built incrementally in the background and STOCKPILED.
- *    Stockpiling never touches the prompt, so the prompt cache stays intact.
- *  - When the visible chat history reaches a token threshold, all stockpiled
- *    summaries are APPLIED at once: their source messages are flagged with
- *    ST's ignore symbol (excluded from the prompt) and the summary block is
- *    spliced into the outgoing chat by a generate_interceptor — i.e. into
- *    the exact array that gets sent, not a registration that can be wiped.
- *  - The injected summary block has a token budget. When it grows past the
- *    budget, the oldest applied summaries are consolidated into a single
- *    "chapter" summary in the background.
+ * Architecture (merged edition of Stockpile Memory):
+ *  - The MAIN model declares scene presence with tiny HTML-comment blocks
+ *    (login / logout), and introduces characters with a profile block.
+ *    The extension parses and strips those blocks, keeping a cast roster.
+ *  - A SUB model (any connection profile / endpoint) writes memories.
+ *    When a scene closes (everyone logged out, a token threshold, or a
+ *    manual tap), the sub model reads the scene and writes, for each
+ *    participant, that character's OWN subjective memories, plus shared
+ *    world-memory entries. Characters who were not present get nothing —
+ *    information asymmetry is structural, not prompted.
+ *  - A generate_interceptor splices a <cast_memory> block into the exact
+ *    outgoing chat array: world memory, the profiles + memories of the
+ *    characters currently on stage, and the full roster. Raw history is
+ *    kept only for the current scene plus a short tail; older messages
+ *    are flagged with ST's ignore symbol — but ONLY when a written
+ *    memory covers them. Unwritten messages are never hidden.
  *
- * Storage: settings in extensionSettings['stockpile_memory'],
- * per-chat data in chatMetadata['stockpile_memory'].
+ * Storage: settings in extensionSettings['cast_memory'],
+ * per-chat data in chatMetadata['cast_memory'].
  */
 
-const MODULE = 'stockpile_memory';
-const LOG_PREFIX = '[StockpileMemory]';
+const MODULE = 'cast_memory';
+const LOG_PREFIX = '[CastMemory]';
+const VERSION = '2.0.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
 
-const smErrors = [];
+const cmErrors = [];
 function noteError(where, e) {
     const msg = (e && e.message) ? e.message : String(e);
-    smErrors.push(`${where}: ${msg}`);
+    cmErrors.push(`${where}: ${msg}`);
     warn(where, e);
     reportDiag();
 }
 function reportDiag() {
-    const el = document.getElementById('sm_diag');
+    const el = (typeof document !== 'undefined') ? document.getElementById('cm_diag') : null;
     if (!el) return;
-    const fabEl = document.getElementById('sm-fab');
-    const sheetEl = smSheetEl;
-    const wand = document.getElementById('sm-wand-entry') ? 'OK' : 'NG';
+    const fabEl = document.getElementById('cm-fab');
+    const wand = document.getElementById('cm-wand-entry') ? 'OK' : 'NG';
     let geo = '';
     try {
         if (fabEl) {
@@ -44,12 +49,11 @@ function reportDiag() {
             geo = ` | fabRect=${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`
                 + ` disp=${cs.display} vis=${cs.visibility} pos=${cs.position}`;
         }
-        geo += ` | popup=${smPopupOpen ? 'open' : 'closed'}`;
+        geo += ` | popup=${cmPopupOpen ? 'open' : 'closed'}`;
         geo += ` | win=${window.innerWidth}x${window.innerHeight}`;
-        if (window.visualViewport) geo += ` vv=${Math.round(window.visualViewport.width)}x${Math.round(window.visualViewport.height)}`;
     } catch { /* diag must never throw */ }
-    el.textContent = `diag v1.1.1: fab=${fabEl ? 'OK' : 'NG'} sheet=${sheetEl ? 'OK' : 'NG'} wand=${wand}`
-        + (smErrors.length ? ` | errors: ${smErrors.slice(-3).join(' ; ')}` : ' | errors: none')
+    el.textContent = `diag v${VERSION}: fab=${fabEl ? 'OK' : 'NG'} sheet=${cmSheetEl ? 'OK' : 'NG'} wand=${wand}`
+        + (cmErrors.length ? ` | errors: ${cmErrors.slice(-3).join(' ; ')}` : ' | errors: none')
         + geo;
 }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -58,57 +62,63 @@ function escapeHtml(str) {
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+function newId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 const defaultSettings = Object.freeze({
     enabled: true,
-    autoApply: true,
-    verbatimTurns: 10,          // newest assistant turns always kept raw
-    turnsPerSummary: 3,         // assistant turns per stockpiled batch
-    applyThresholdTokens: 12000, // visible-history tokens that trigger an apply
-    memoryBudgetTokens: 3000,    // max tokens of the injected summary block
-    summarizerResponseLength: 1000,
-    connectionSource: 'default', // 'default' | 'profile' | 'openai' | 'ollama'
+    keepTailMessages: 10,        // newest chat messages always kept raw
+    sceneThresholdTokens: 6000,  // unwritten tokens that force a mid-scene write
+    memoryBudgetTokens: 3000,    // max tokens of injected memory sections
+    foldCharThreshold: 4000,     // per-character memory chars before folding
+    summarizerResponseLength: 3000,
+    connectionSource: 'profile', // 'default' | 'profile' | 'openai' | 'ollama'
     profileId: '',
     openaiUrl: '',
     openaiKey: '',
     openaiModel: '',
     ollamaUrl: 'http://localhost:11434',
     ollamaModel: '',
-    systemPrompt:
-        'Role: precise narrative-state tracker. Output only the summary — no preamble, no commentary, no markdown.',
-    userPrompt:
-        `<player_name>
-{{player_name}}
-</player_name>
-
-<prior_context>
-{{context_str}}
-</prior_context>
-
-<passage_in_question>
+    writerSystemPrompt:
+        'You are the memory keeper for a fictional roleplay. You read a scene and write memory records as strict JSON. Output ONLY the JSON object — no preamble, no commentary, no code fences.',
+    writerUserPrompt:
+        `<scene>
 {{story_txt}}
-</passage_in_question>
+</scene>
 
-Summarize only the necessary elements from the passage_in_question to coherently continue the prior_context. If the passage_in_question has 2nd person point of view, 'you' in prose refers to the player. Use the player name in the summary output instead of 'you'.
+<participants>
+{{participants}}
+</participants>
 
-Focus on: character interactions and relationship dynamics (including shifts in feelings, trust, suspicion or intimacy); decisions, promises and agreements; emotional beats and motivations; names, locations and time; plot developments and unresolved threads; details that distinguish this moment from any other.
+<world_memory_so_far>
+{{world_so_far}}
+</world_memory_so_far>
 
-Exclude anything insubstantial, fluff, or events already covered in prior_context.
+Write the memory records for this scene as JSON with exactly this shape:
+{"world": "...", "memories": {"<participant name>": "...", ...}}
 
-Write in short phrases; output must be a single line:`,
-    consolidateSystemPrompt:
-        'Role: precise narrative-state tracker. Output only the merged summary — no preamble, no commentary, no markdown.',
-    consolidateUserPrompt:
-        `<summaries_to_merge>
-{{summaries}}
-</summaries_to_merge>
+Rules:
+- "world": objective, shared facts only — what happened, where, when; decisions and promises anyone present could know; changes to places, items or ongoing situations; unresolved threads. Short markdown lines, no dialogue quotes. If nothing world-level changed, use "".
+- "memories": one entry per participant listed above, keyed by their exact name. Write what THAT character personally experienced: what they saw, heard, were told, felt, decided, misunderstood, or are now suspicious / hopeful / afraid about. Subjective, first-person viewpoint ("I ...") in brief markdown lines. A character can only remember things they were present for — never give them knowledge from outside this scene. If a participant was present but nothing notable happened to them, use "".
+- Keep every entry tight: only what would change how that character acts later. No atmosphere, no prose retelling.`,
+    foldSystemPrompt:
+        'You condense long-term memory records. Output only the condensed memory text — no preamble, no commentary.',
+    foldUserPrompt:
+        `<memory_to_condense>
+{{memory_txt}}
+</memory_to_condense>
 
-Merge these consecutive summaries into ONE shorter chapter summary. Preserve: names, relationship changes (feelings, trust, suspicion stages), promises and agreements, important decisions, injuries or lasting changes, and unresolved threads. Drop scene-level detail, dialogue specifics and atmosphere. Keep it noticeably shorter than the combined originals.
+Condense this into a shorter long-term memory. Preserve: relationship changes (feelings, trust, suspicion stages), promises and agreements, important decisions, secrets the character holds, lasting changes and unresolved threads involving them. Drop scene-level detail and anything already resolved. Keep the same viewpoint as the original. Output markdown lines only.`,
+    worldFoldUserPrompt:
+        `<memory_to_condense>
+{{memory_txt}}
+</memory_to_condense>
 
-Write in short phrases; output must be a single paragraph:`,
-    iconLeft: null,  // floating button position (px, viewport coords)
+Condense this world memory into a shorter long-term record. Preserve: the current state of places and situations, key past events still affecting the present, promises and agreements, and unresolved threads. Drop detail that no longer matters. Output markdown lines only.`,
+    iconLeft: null,
     iconTop: null,
 });
 
@@ -130,24 +140,55 @@ function saveSettings() {
 
 // ─── Per-chat store ──────────────────────────────────────────────────────────
 // store = {
-//   items: [{ kind: 'batch'|'chapter', text, start, end, ts, covers? }],
-//   summarizedUpTo: -1,  // chat index; items partition [0..summarizedUpTo]
-//   appliedUpTo: -1,     // chat index; items with end <= appliedUpTo are live
+//   version: 1,
+//   characters: { [name]: { profile, memories: [{id,text,start,end,ts}],
+//                           longTerm, present, created, updated } },
+//   worldSetting: '',              // static world info from world blocks
+//   worldEntries: [{id,text,start,end,ts}],
+//   worldLongTerm: '',
+//   presence: [{index, name, action}],   // login/logout transitions
+//   parsedUpTo: -1,    // chat index; blocks parsed (and stripped) up to here
+//   writtenUpTo: -1,   // chat index covered by memory writing
+//   appliedUpTo: -1,   // chat index hidden via ignore flag (<= writtenUpTo)
 // }
+
+function emptyStore() {
+    return {
+        version: 1,
+        characters: {},
+        worldSetting: '',
+        worldEntries: [],
+        worldLongTerm: '',
+        presence: [],
+        parsedUpTo: -1,
+        writtenUpTo: -1,
+        appliedUpTo: -1,
+    };
+}
 
 function getStore() {
     const ctx = SillyTavern.getContext();
     if (!ctx.chatMetadata) return null;
     if (!ctx.chatMetadata[MODULE]) {
-        ctx.chatMetadata[MODULE] = { items: [], summarizedUpTo: -1, appliedUpTo: -1 };
+        ctx.chatMetadata[MODULE] = emptyStore();
     }
     const store = ctx.chatMetadata[MODULE];
-    if (!Array.isArray(store.items)) store.items = [];
-    if (!Number.isInteger(store.summarizedUpTo)) {
-        store.summarizedUpTo = store.items.length ? store.items[store.items.length - 1].end : -1;
+    // Defensive shape repair (older/partial data).
+    if (!store.characters || typeof store.characters !== 'object') store.characters = {};
+    if (typeof store.worldSetting !== 'string') store.worldSetting = '';
+    if (!Array.isArray(store.worldEntries)) store.worldEntries = [];
+    if (typeof store.worldLongTerm !== 'string') store.worldLongTerm = '';
+    if (!Array.isArray(store.presence)) store.presence = [];
+    for (const k of ['parsedUpTo', 'writtenUpTo', 'appliedUpTo']) {
+        if (!Number.isInteger(store[k])) store[k] = -1;
     }
-    if (!Number.isInteger(store.appliedUpTo)) store.appliedUpTo = -1;
-    if (store.appliedUpTo > store.summarizedUpTo) store.appliedUpTo = store.summarizedUpTo;
+    if (store.appliedUpTo > store.writtenUpTo) store.appliedUpTo = store.writtenUpTo;
+    for (const ch of Object.values(store.characters)) {
+        if (!Array.isArray(ch.memories)) ch.memories = [];
+        if (typeof ch.profile !== 'string') ch.profile = '';
+        if (typeof ch.longTerm !== 'string') ch.longTerm = '';
+        ch.present = !!ch.present;
+    }
     return store;
 }
 
@@ -159,75 +200,167 @@ function saveStore() {
     }, 400);
 }
 
-function stockpiledItems(store) {
-    return store.items.filter(it => it.end > store.appliedUpTo);
-}
-function appliedItems(store) {
-    return store.items.filter(it => it.end <= store.appliedUpTo);
-}
-
-// ─── Turn bookkeeping ────────────────────────────────────────────────────────
-
-function getAssistantTurns(chat) {
-    const turns = [];
-    for (let i = 0; i < chat.length; i++) {
-        const m = chat[i];
-        if (!m || m.is_user || m.is_system) continue;
-        if (!m.mes || !m.mes.trim()) continue;
-        turns.push({ index: i });
+function getCharacter(store, name) {
+    if (!store.characters[name]) {
+        store.characters[name] = {
+            profile: '', memories: [], longTerm: '',
+            present: false, created: Date.now(), updated: Date.now(),
+        };
     }
-    return turns;
+    return store.characters[name];
 }
 
-/** Assistant turns that still need a summary (outside the keep window). */
-function getEligibleTurns() {
-    const s = getSettings();
-    const store = getStore();
-    const { chat } = SillyTavern.getContext();
-    if (!store || !chat) return [];
-    const all = getAssistantTurns(chat);
-    const keepFrom = Math.max(0, all.length - s.verbatimTurns);
-    const keep = new Set(all.slice(keepFrom).map(t => t.index));
-    return all.filter(t => t.index > store.summarizedUpTo && !keep.has(t.index));
+function characterNames(store) {
+    return Object.keys(store.characters);
 }
 
-function playerName() {
-    try { return SillyTavern.getContext().name1 || 'the player'; } catch (e) { return 'the player'; }
+function presentNames(store) {
+    return characterNames(store).filter(n => store.characters[n].present);
 }
 
-function buildPassage(start, end) {
-    const { chat, name1, name2 } = SillyTavern.getContext();
-    const parts = [];
-    for (let i = start; i <= end && i < chat.length; i++) {
-        const m = chat[i];
-        if (!m || m.is_system || !m.mes || !m.mes.trim()) continue;
-        const name = m.name || (m.is_user ? name1 : name2);
-        parts.push(`${name}: ${m.mes.trim()}`);
+// ─── Block parsing (pure) ────────────────────────────────────────────────────
+// Blocks the main model emits inside its replies (HTML comments):
+//   <!-- castmemory: login Name -->  /  <!-- castmemory: logout Name -->
+//   <!-- castmemory character start
+//   Name: X
+//   ...profile markdown...
+//   castmemory character end -->
+//   <!-- castmemory world start
+//   ...world info markdown...
+//   castmemory world end -->
+
+const LOGIN_RE = /<!--\s*castmemory:\s*login\s+([^>]+?)\s*-->/gi;
+const LOGOUT_RE = /<!--\s*castmemory:\s*logout\s+([^>]+?)\s*-->/gi;
+const CHAR_BLOCK_RE = /<!--\s*castmemory\s+character\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+character\s+end\s*-->/gi;
+const WORLD_BLOCK_RE = /<!--\s*castmemory\s+world\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+world\s+end\s*-->/gi;
+
+/** Extract every castmemory block from a message text. Pure. */
+function parseBlocks(text) {
+    const found = [];
+    if (!text) return found;
+    let m;
+    const collect = (re, make) => {
+        re.lastIndex = 0;
+        while ((m = re.exec(text)) !== null) {
+            found.push({ at: m.index, ...make(m) });
+        }
+    };
+    collect(LOGIN_RE, (mm) => ({ kind: 'login', name: mm[1].trim() }));
+    collect(LOGOUT_RE, (mm) => ({ kind: 'logout', name: mm[1].trim() }));
+    collect(CHAR_BLOCK_RE, (mm) => {
+        const body = mm[1].trim();
+        const nameLine = body.split('\n').map(x => x.trim()).find(x => /^name\s*:/i.test(x));
+        const name = nameLine ? nameLine.replace(/^name\s*:\s*/i, '').trim() : '';
+        const profile = body.split('\n').filter(x => x !== nameLine).join('\n').trim();
+        return { kind: 'character', name, profile: profile || body };
+    });
+    collect(WORLD_BLOCK_RE, (mm) => ({ kind: 'world', text: mm[1].trim() }));
+    found.sort((a, b) => a.at - b.at);
+    return found;
+}
+
+/** Remove every castmemory block from a message text. Pure. */
+function stripBlocks(text) {
+    if (!text) return text;
+    return text
+        .replace(LOGIN_RE, '')
+        .replace(LOGOUT_RE, '')
+        .replace(CHAR_BLOCK_RE, '')
+        .replace(WORLD_BLOCK_RE, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+/**
+ * Apply one parsed block to the store at chat position `index`.
+ * Returns true when the store changed.
+ */
+function applyBlock(store, block, index) {
+    if (!block || !block.kind) return false;
+    switch (block.kind) {
+        case 'login': {
+            if (!block.name) return false;
+            const ch = getCharacter(store, block.name);
+            if (!ch.present) {
+                ch.present = true;
+                ch.updated = Date.now();
+            }
+            store.presence.push({ index, name: block.name, action: 'login' });
+            return true;
+        }
+        case 'logout': {
+            if (!block.name) return false;
+            const ch = getCharacter(store, block.name);
+            if (ch.present) {
+                ch.present = false;
+                ch.updated = Date.now();
+            }
+            store.presence.push({ index, name: block.name, action: 'logout' });
+            return true;
+        }
+        case 'character': {
+            if (!block.name) return false;
+            const ch = getCharacter(store, block.name);
+            ch.profile = block.profile || ch.profile;
+            ch.updated = Date.now();
+            // Being introduced means being on stage.
+            if (!ch.present) {
+                ch.present = true;
+                store.presence.push({ index, name: block.name, action: 'login' });
+            }
+            return true;
+        }
+        case 'world': {
+            if (!block.text) return false;
+            store.worldSetting = store.worldSetting
+                ? `${store.worldSetting}\n\n${block.text}`
+                : block.text;
+            return true;
+        }
     }
-    let text = parts.join('\n');
-    const MAX = 16000;
-    if (text.length > MAX) text = text.slice(0, MAX);
-    return text;
+    return false;
 }
 
-/** Prior summaries as context for the next summarizer call (recent-biased). */
-function buildContextStr() {
-    const store = getStore();
-    if (!store || store.items.length === 0) return '';
-    const texts = store.items.map(it => it.text);
-    let joined = texts.join('\n');
-    const MAX = 6000;
-    while (joined.length > MAX && texts.length > 1) {
-        texts.shift();
-        joined = texts.join('\n');
+/**
+ * Names present during chat range [start, end], from the presence log.
+ * A character counts when a login at or before `end` is not closed by a
+ * logout at or before `end`, and the interval intersects [start, end]. Pure.
+ */
+function participantsForRange(store, start, end) {
+    const intervals = {}; // name -> [[from, to], ...] (to = Infinity while open)
+    for (const p of store.presence) {
+        if (!intervals[p.name]) intervals[p.name] = [];
+        const list = intervals[p.name];
+        if (p.action === 'login') {
+            list.push([p.index, Infinity]);
+        } else {
+            for (let i = list.length - 1; i >= 0; i--) {
+                if (list[i][1] === Infinity) { list[i][1] = p.index; break; }
+            }
+        }
     }
-    return joined;
+    const names = [];
+    for (const [name, list] of Object.entries(intervals)) {
+        if (list.some(([a, b]) => a <= end && b >= start)) names.push(name);
+    }
+    return names;
+}
+
+/** Recompute present flags from the presence log (after edits/deletes). */
+function recomputePresence(store) {
+    for (const name of characterNames(store)) store.characters[name].present = false;
+    const sorted = [...store.presence].sort((a, b) => a.index - b.index);
+    for (const p of sorted) {
+        const ch = store.characters[p.name];
+        if (ch) ch.present = (p.action === 'login');
+    }
 }
 
 // ─── Token estimation ────────────────────────────────────────────────────────
 
 const _tokenCache = new Map(); // chat index -> { mes, tokens }
 let lastTokenEstimate = -1;
+let lastUnwrittenEstimate = -1;
 
 function ignoreSymbol() {
     return SillyTavern.getContext().symbols.ignore;
@@ -242,7 +375,7 @@ async function estimateChatTokens() {
             const msg = chat[i];
             if (!msg || !msg.mes) continue;
             if (msg.is_system) continue;
-            if (msg.extra?.[IGNORE]) continue; // applied → not sent
+            if (msg.extra?.[IGNORE]) continue;
             const cached = _tokenCache.get(i);
             if (cached && cached.mes === msg.mes) { total += cached.tokens; continue; }
             let tokens;
@@ -258,24 +391,38 @@ async function estimateChatTokens() {
     }
 }
 
-const _itemTokenCache = new Map(); // item text -> tokens
-async function estimateItemsTokens(items) {
-    const { getTokenCountAsync } = SillyTavern.getContext();
+const _textTokenCache = new Map();
+async function estimateTextTokens(text) {
+    if (!text) return 0;
+    if (_textTokenCache.has(text)) return _textTokenCache.get(text);
+    let tokens;
+    try { tokens = await SillyTavern.getContext().getTokenCountAsync(text, 0); }
+    catch (e) { tokens = Math.ceil(text.length / 2); }
+    _textTokenCache.set(text, tokens);
+    return tokens;
+}
+
+/** Tokens of chat messages in (fromExclusive, toInclusive] not yet ignored. */
+async function estimateRangeTokens(fromExclusive, toInclusive) {
+    const { chat, getTokenCountAsync } = SillyTavern.getContext();
     let total = 0;
-    for (const it of items) {
-        if (_itemTokenCache.has(it.text)) { total += _itemTokenCache.get(it.text); continue; }
+    for (let i = fromExclusive + 1; i <= toInclusive && i < chat.length; i++) {
+        const msg = chat[i];
+        if (!msg || !msg.mes || msg.is_system) continue;
+        const cached = _tokenCache.get(i);
+        if (cached && cached.mes === msg.mes) { total += cached.tokens; continue; }
         let tokens;
-        try { tokens = await getTokenCountAsync(it.text, 0); }
-        catch (e) { tokens = Math.ceil(it.text.length / 2); }
-        _itemTokenCache.set(it.text, tokens);
+        try { tokens = await getTokenCountAsync(msg.mes, 0); }
+        catch (e) { tokens = Math.ceil(msg.mes.length / 2); }
+        _tokenCache.set(i, { mes: msg.mes, tokens });
         total += tokens;
     }
     return total;
 }
 
-// ─── Summarizer calls ────────────────────────────────────────────────────────
+// ─── Sub-model calls ─────────────────────────────────────────────────────────
 
-let lastSummarizerError = '';
+let lastWriterError = '';
 
 function extractText(res) {
     if (!res) return '';
@@ -283,13 +430,13 @@ function extractText(res) {
     return res.content || res.text || res?.choices?.[0]?.message?.content || '';
 }
 
-async function callSummarizerOnce(systemPrompt, userPrompt) {
+async function callSubModelOnce(systemPrompt, userPrompt) {
     const s = getSettings();
     const ctx = SillyTavern.getContext();
 
     switch (s.connectionSource) {
         case 'profile': {
-            if (!s.profileId) throw new Error('No connection profile selected (Stockpile Memory settings)');
+            if (!s.profileId) throw new Error('接続プロファイルが未選択です（Cast Memory設定）');
             const svc = ctx.ConnectionManagerRequestService;
             if (!svc || typeof svc.sendRequest !== 'function') {
                 throw new Error('ConnectionManagerRequestService is not available in this SillyTavern version');
@@ -301,7 +448,7 @@ async function callSummarizerOnce(systemPrompt, userPrompt) {
             return extractText(res);
         }
         case 'openai': {
-            if (!s.openaiUrl || !s.openaiModel) throw new Error('OpenAI-compatible URL / model not set');
+            if (!s.openaiUrl || !s.openaiModel) throw new Error('OpenAI互換のURL / モデルが未設定です');
             const base = s.openaiUrl.replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
             const res = await fetch(`${base}/chat/completions`, {
                 method: 'POST',
@@ -324,7 +471,7 @@ async function callSummarizerOnce(systemPrompt, userPrompt) {
             return data?.choices?.[0]?.message?.content || '';
         }
         case 'ollama': {
-            if (!s.ollamaModel) throw new Error('Ollama model not set');
+            if (!s.ollamaModel) throw new Error('Ollamaモデルが未設定です');
             const base = (s.ollamaUrl || 'http://localhost:11434').replace(/\/+$/, '');
             const res = await fetch(`${base}/api/chat`, {
                 method: 'POST',
@@ -354,100 +501,248 @@ async function callSummarizerOnce(systemPrompt, userPrompt) {
     }
 }
 
-function cleanSummaryText(raw) {
+/** Strip thinking blocks and code fences from a sub-model reply. */
+function cleanModelText(raw) {
     if (!raw) return '';
     let t = String(raw);
     t = t.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
     t = t.replace(/<think>[\s\S]*?<\/think>/gi, '');
-    t = t.replace(/```[a-z]*|```/g, '');
-    t = t.split('\n').map(x => x.trim()).filter(Boolean).join(' ');
     return t.trim();
 }
 
-async function callSummarizer(systemPrompt, userPrompt) {
+async function callSubModel(systemPrompt, userPrompt) {
     for (let attempt = 0; attempt < 2; attempt++) {
         try {
-            const raw = await callSummarizerOnce(systemPrompt, userPrompt);
-            const text = cleanSummaryText(raw);
-            if (text) { lastSummarizerError = ''; return text; }
-            lastSummarizerError = 'Summarizer returned an empty response';
+            const raw = await callSubModelOnce(systemPrompt, userPrompt);
+            const text = cleanModelText(raw);
+            if (text) { lastWriterError = ''; return text; }
+            lastWriterError = 'サブモデルが空の応答を返しました';
         } catch (e) {
-            lastSummarizerError = String(e?.message || e);
-            warn('summarizer attempt failed:', e);
+            lastWriterError = String(e?.message || e);
+            warn('sub-model attempt failed:', e);
         }
         if (attempt === 0) await sleep(1500);
     }
     return '';
 }
 
-// ─── Stockpile ───────────────────────────────────────────────────────────────
+/**
+ * Extract the memory-writing JSON from a sub-model reply.
+ * Returns { world: string, memories: {name: string} } or null. Pure.
+ */
+function parseWriterOutput(raw) {
+    if (!raw) return null;
+    let t = cleanModelText(raw).replace(/```(?:json)?/gi, '');
+    const start = t.indexOf('{');
+    const end = t.lastIndexOf('}');
+    if (start < 0 || end <= start) return null;
+    try {
+        const obj = JSON.parse(t.slice(start, end + 1));
+        const world = typeof obj.world === 'string' ? obj.world.trim() : '';
+        const memories = {};
+        if (obj.memories && typeof obj.memories === 'object') {
+            for (const [k, v] of Object.entries(obj.memories)) {
+                if (typeof v === 'string' && v.trim()) memories[k] = v.trim();
+            }
+        }
+        if (!world && Object.keys(memories).length === 0) return null;
+        return { world, memories };
+    } catch (e) {
+        return null;
+    }
+}
+
+// ─── Passage building ────────────────────────────────────────────────────────
+
+function playerName() {
+    try { return SillyTavern.getContext().name1 || 'the player'; } catch (e) { return 'the player'; }
+}
+
+function buildPassage(start, end) {
+    const { chat, name1, name2 } = SillyTavern.getContext();
+    const parts = [];
+    for (let i = start; i <= end && i < chat.length; i++) {
+        const m = chat[i];
+        if (!m || m.is_system || !m.mes || !m.mes.trim()) continue;
+        const name = m.name || (m.is_user ? name1 : name2);
+        parts.push(`${name}: ${m.mes.trim()}`);
+    }
+    let text = parts.join('\n');
+    const MAX = 24000;
+    if (text.length > MAX) text = text.slice(0, MAX);
+    return text;
+}
+
+function lastAssistantIndex() {
+    const { chat } = SillyTavern.getContext();
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (m && !m.is_user && !m.is_system && m.mes && m.mes.trim()) return i;
+    }
+    return -1;
+}
+
+function assistantCountInRange(start, end) {
+    const { chat } = SillyTavern.getContext();
+    let n = 0;
+    for (let i = start; i <= end && i < chat.length; i++) {
+        const m = chat[i];
+        if (m && !m.is_user && !m.is_system && m.mes && m.mes.trim()) n++;
+    }
+    return n;
+}
+
+function worldSoFarText(store) {
+    const parts = [];
+    if (store.worldLongTerm) parts.push(store.worldLongTerm);
+    for (const e of store.worldEntries) parts.push(e.text);
+    let joined = parts.join('\n');
+    const MAX = 5000;
+    while (joined.length > MAX && parts.length > 1) {
+        parts.shift();
+        joined = parts.join('\n');
+    }
+    return joined;
+}
+
+// ─── Memory writing (scene close) ────────────────────────────────────────────
 
 let isWorking = false;
 
-/** Summarize one batch of eligible turns into the stockpile. No prompt changes. */
-async function stockpileOneBatch() {
+/**
+ * Write memories for one range. Participants come from the presence log;
+ * when nobody was logged in, fall back to known characters named in the
+ * passage; when still nobody, the scene goes to world memory only, so
+ * nothing is ever lost. Advances writtenUpTo on success.
+ */
+async function writeMemoriesForRange(start, end) {
     const s = getSettings();
     const store = getStore();
-    if (!store) return false;
-    const eligible = getEligibleTurns();
-    if (eligible.length === 0) return false;
+    if (!store || end < start) return false;
 
-    const batch = eligible.slice(0, s.turnsPerSummary);
-    const endIdx = batch[batch.length - 1].index;
-    const startIdx = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
-
-    if (startIdx > endIdx) {
-        store.summarizedUpTo = endIdx;
+    const passage = buildPassage(start, end);
+    if (!passage.trim()) {
+        store.writtenUpTo = end;
         saveStore();
-        return 'skip';
+        return true;
     }
 
-    const storyTxt = buildPassage(startIdx, endIdx);
-    if (!storyTxt.trim()) {
-        store.summarizedUpTo = endIdx;
-        saveStore();
-        return 'skip';
+    let participants = participantsForRange(store, start, end);
+    if (participants.length === 0) {
+        participants = characterNames(store).filter(n => passage.includes(n));
     }
 
-    const userPrompt = s.userPrompt
+    const userPrompt = s.writerUserPrompt
         .replaceAll('{{player_name}}', playerName())
-        .replaceAll('{{context_str}}', buildContextStr() || '(none yet)')
-        .replaceAll('{{story_txt}}', storyTxt);
+        .replaceAll('{{participants}}', participants.length ? participants.join(', ') : '(no named participants — write world memory only, with an empty memories object)')
+        .replaceAll('{{world_so_far}}', worldSoFarText(store) || '(none yet)')
+        .replaceAll('{{story_txt}}', passage);
 
-    const summary = await callSummarizer(s.systemPrompt, userPrompt);
-    if (!summary) return false;
+    const raw = await callSubModel(s.writerSystemPrompt, userPrompt);
+    if (!raw) return false;
 
-    store.items.push({ kind: 'batch', text: summary, start: startIdx, end: endIdx, ts: Date.now() });
-    store.summarizedUpTo = endIdx;
+    const parsed = parseWriterOutput(raw);
+    const ts = Date.now();
+    if (parsed) {
+        if (parsed.world) {
+            store.worldEntries.push({ id: newId(), text: parsed.world, start, end, ts });
+        }
+        for (const [name, text] of Object.entries(parsed.memories)) {
+            const ch = store.characters[name];
+            if (!ch) continue; // never invent characters from sub-model output
+            ch.memories.push({ id: newId(), text, start, end, ts });
+            ch.updated = ts;
+        }
+        // Participants the sub model skipped still need coverage proof:
+        // the range counts as written (world entry or not) — the write
+        // itself is the coverage. Nothing is hidden without this step.
+    } else {
+        // Degraded fallback: keep the whole reply as a world entry so the
+        // range is covered and no information is lost.
+        const text = cleanModelText(raw).replace(/```[a-z]*/gi, '').trim();
+        if (!text) return false;
+        store.worldEntries.push({ id: newId(), text, start, end, ts });
+        warn('writer output was not JSON; stored as world memory');
+    }
+
+    store.writtenUpTo = end;
     saveStore();
-    log(`Stockpiled batch [${startIdx}–${endIdx}] (${store.items.length} items total)`);
+    log(`Wrote memories for [${start}–${end}] participants=[${participants.join(', ')}]`);
     return true;
 }
 
-/** Stockpile everything eligible (used by the "Summarize now" button). */
-async function stockpileAll(onProgress) {
-    if (isWorking) return;
+/**
+ * Decide whether to close the current scene and write its memories.
+ * Auto-close when: everyone is logged out and at least 2 assistant
+ * messages are unwritten, or unwritten tokens pass the threshold.
+ */
+async function maybeWriteScene(manual = false) {
+    const s = getSettings();
+    const store = getStore();
+    if (!store || isWorking) return false;
+    const end = lastAssistantIndex();
+    if (end <= store.writtenUpTo) return false;
+    const start = store.writtenUpTo + 1;
+
+    lastUnwrittenEstimate = await estimateRangeTokens(store.writtenUpTo, end);
+    const nobodyPresent = presentNames(store).length === 0;
+    const enoughTurns = assistantCountInRange(start, end) >= 2;
+    const overThreshold = lastUnwrittenEstimate >= s.sceneThresholdTokens;
+    if (!manual && !((nobodyPresent && enoughTurns) || overThreshold)) return false;
+
     isWorking = true;
     try {
-        let guard = 0;
-        while (getEligibleTurns().length > 0 && guard++ < 200) {
-            const r = await stockpileOneBatch();
-            if (r === false) break; // summarizer failing — stop, keep progress
-            if (onProgress) onProgress();
-            updateUI();
+        const ok = await writeMemoriesForRange(start, end);
+        if (ok) {
+            advanceApplied();
+            await maybeFold();
         }
-        await estimateChatTokens();
-        if (getSettings().autoApply) await maybeApply();
-        await maybeConsolidate();
+        return ok;
     } finally {
         isWorking = false;
         updateUI();
     }
 }
 
-// ─── Apply ───────────────────────────────────────────────────────────────────
+// ─── Apply (ignore flags) ────────────────────────────────────────────────────
+// Invariant: appliedUpTo never passes writtenUpTo, and always lands on a
+// memory-entry boundary, so every hidden message is covered by an entry
+// that will be injected.
 
-/** Flag every chat message covered by applied summaries with ST's ignore symbol. */
+function entryBoundaries(store) {
+    const ends = new Set();
+    for (const e of store.worldEntries) ends.add(e.end);
+    for (const ch of Object.values(store.characters)) {
+        for (const m of ch.memories) ends.add(m.end);
+    }
+    return [...ends].sort((a, b) => a - b);
+}
+
+function advanceApplied() {
+    const s = getSettings();
+    const store = getStore();
+    if (!store) return;
+    const { chat } = SillyTavern.getContext();
+    if (!chat) return;
+    const candidate = Math.min(store.writtenUpTo, chat.length - 1 - s.keepTailMessages);
+    if (candidate <= store.appliedUpTo) return;
+    let target = store.appliedUpTo;
+    for (const end of entryBoundaries(store)) {
+        if (end <= candidate && end > target) target = end;
+    }
+    // Ranges written before any character/world entry existed (empty
+    // passages) have no entries; writtenUpTo itself is a safe boundary.
+    if (target === store.appliedUpTo && candidate === store.writtenUpTo) {
+        target = candidate;
+    }
+    if (target > store.appliedUpTo) {
+        store.appliedUpTo = target;
+        markAppliedMessages();
+        saveStore();
+        log(`Applied: history hidden up to message ${target}`);
+    }
+}
+
 function markAppliedMessages() {
     const store = getStore();
     if (!store || store.appliedUpTo < 0) return;
@@ -475,108 +770,215 @@ function unmarkAllMessages() {
     } catch (e) { /* noop */ }
 }
 
-/** Swap the stockpile into the prompt. Returns true if anything changed. */
-function applyNow(manual = false) {
+/** Undo the hiding only (memories stay; originals are sent again). */
+function unapplyAll() {
     const store = getStore();
-    if (!store) return false;
-    if (store.summarizedUpTo <= store.appliedUpTo) {
-        if (manual) toastr.info('No stockpiled summaries waiting to be applied.', 'Stockpile Memory');
-        return false;
-    }
-    const prev = store.appliedUpTo;
-    store.appliedUpTo = store.summarizedUpTo;
-    markAppliedMessages();
+    if (!store) return;
+    store.appliedUpTo = -1;
+    unmarkAllMessages();
     saveStore();
-    log(`Applied: appliedUpTo ${prev} → ${store.appliedUpTo}`);
-    toastr.success(
-        `Memory applied: summaries now cover the chat up to message ${store.appliedUpTo}. Originals are excluded from the prompt.`,
-        'Stockpile Memory',
-        { timeOut: 4000 }
-    );
+}
+
+// ─── Folding (long-term compression) ─────────────────────────────────────────
+
+async function foldCharacter(name) {
+    const s = getSettings();
+    const store = getStore();
+    const ch = store?.characters[name];
+    if (!ch || ch.memories.length < 2) return false;
+    const totalChars = ch.memories.reduce((a, m) => a + m.text.length, 0) + ch.longTerm.length;
+    if (totalChars <= s.foldCharThreshold) return false;
+    // Keep the 2 newest entries raw; fold the rest into longTerm.
+    const keep = ch.memories.slice(-2);
+    const fold = ch.memories.slice(0, -2);
+    if (fold.length === 0) return false;
+    const joined = (ch.longTerm ? ch.longTerm + '\n' : '') + fold.map(m => m.text).join('\n');
+    const userPrompt = s.foldUserPrompt.replaceAll('{{memory_txt}}', joined);
+    const out = await callSubModel(s.foldSystemPrompt, userPrompt);
+    if (!out) return false;
+    ch.longTerm = cleanModelText(out).replace(/```[a-z]*/gi, '').trim();
+    ch.memories = keep;
+    ch.updated = Date.now();
+    saveStore();
+    log(`Folded memories of ${name} (${fold.length} entries → long-term)`);
     return true;
 }
 
-async function maybeApply() {
+async function foldWorld() {
     const s = getSettings();
     const store = getStore();
-    if (!store) return;
-    if (store.summarizedUpTo <= store.appliedUpTo) return;
-    const tokens = lastTokenEstimate >= 0 ? lastTokenEstimate : await estimateChatTokens();
-    if (tokens < 0 || tokens < s.applyThresholdTokens) return;
-    log(`History ≈ ${tokens} tokens ≥ threshold ${s.applyThresholdTokens} — applying stockpile.`);
-    applyNow(false);
+    if (!store || store.worldEntries.length < 2) return false;
+    const totalChars = store.worldEntries.reduce((a, e) => a + e.text.length, 0) + store.worldLongTerm.length;
+    if (totalChars <= s.foldCharThreshold) return false;
+    const keep = store.worldEntries.slice(-2);
+    const fold = store.worldEntries.slice(0, -2);
+    if (fold.length === 0) return false;
+    const joined = (store.worldLongTerm ? store.worldLongTerm + '\n' : '') + fold.map(e => e.text).join('\n');
+    const userPrompt = s.worldFoldUserPrompt.replaceAll('{{memory_txt}}', joined);
+    const out = await callSubModel(s.foldSystemPrompt, userPrompt);
+    if (!out) return false;
+    store.worldLongTerm = cleanModelText(out).replace(/```[a-z]*/gi, '').trim();
+    store.worldEntries = keep;
+    saveStore();
+    log(`Folded world memory (${fold.length} entries → long-term)`);
+    return true;
 }
 
-// ─── Consolidation (chapter summaries) ───────────────────────────────────────
+/** At most one fold per entity per cycle, to bound latency. */
+async function maybeFold() {
+    for (const name of characterNames(getStore() || emptyStore())) {
+        await foldCharacter(name);
+    }
+    await foldWorld();
+}
+
+// ─── Block processing driver ─────────────────────────────────────────────────
 
 /**
- * If the applied (injected) summaries exceed the token budget, merge the
- * oldest applied items into a single chapter summary. Runs in the
- * background; at most 3 merges per cycle.
+ * Scan chat messages after parsedUpTo, apply their blocks and strip the
+ * block text from the messages. Runs on chat load and on new messages,
+ * so blocks emitted while the extension was off are still caught.
  */
-async function maybeConsolidate() {
-    const s = getSettings();
+function processNewBlocks() {
     const store = getStore();
-    if (!store) return;
-
-    for (let mergeRound = 0; mergeRound < 3; mergeRound++) {
-        const applied = appliedItems(store);
-        if (applied.length < 2) return;
-        const tokens = await estimateItemsTokens(applied);
-        if (tokens <= s.memoryBudgetTokens) return;
-
-        // Applied items are always a prefix of store.items (ordered by end).
-        const take = Math.min(6, applied.length);
-        const group = store.items.slice(0, take);
-        if (group.some(it => it.end > store.appliedUpTo)) return; // safety: prefix property broken
-
-        const joined = group.map(it => it.text).join('\n');
-        const userPrompt = s.consolidateUserPrompt.replaceAll('{{summaries}}', joined);
-        const merged = await callSummarizer(s.consolidateSystemPrompt, userPrompt);
-        if (!merged) return;
-
-        const covers = group.reduce((acc, it) => acc + (it.covers || 1), 0);
-        store.items.splice(0, take, {
-            kind: 'chapter',
-            text: merged,
-            start: group[0].start,
-            end: group[group.length - 1].end,
-            ts: Date.now(),
-            covers,
-        });
-        saveStore();
-        log(`Consolidated ${take} items into a chapter [${group[0].start}–${group[group.length - 1].end}]`);
+    if (!store) return false;
+    const { chat } = SillyTavern.getContext();
+    if (!chat) return false;
+    let changed = false;
+    for (let i = store.parsedUpTo + 1; i < chat.length; i++) {
+        const m = chat[i];
+        store.parsedUpTo = i;
+        if (!m || m.is_user || m.is_system || !m.mes) continue;
+        const blocks = parseBlocks(m.mes);
+        if (blocks.length === 0) continue;
+        for (const b of blocks) {
+            if (applyBlock(store, b, i)) changed = true;
+        }
+        const stripped = stripBlocks(m.mes);
+        if (stripped !== m.mes) {
+            m.mes = stripped;
+            _tokenCache.delete(i);
+        }
+        changed = true;
     }
+    if (changed) saveStore();
+    // No re-render needed: the blocks are HTML comments, invisible in the
+    // chat display. Stripping matters for the prompt (tokens) and storage,
+    // both handled by the save above.
+    return changed;
 }
 
-// ─── Memory block + interceptor ──────────────────────────────────────────────
+// ─── Injection ───────────────────────────────────────────────────────────────
 
-function assembleBlock(store) {
-    const applied = appliedItems(store);
-    if (applied.length === 0) return '';
-    let chapterNo = 0;
-    const lines = applied.map(it =>
-        it.kind === 'chapter' ? `[Chapter ${++chapterNo}] ${it.text}` : it.text
-    );
-    return `<stockpile_memory>\n[Summary of earlier events in this conversation — treat this as established history.]\n${lines.join('\n')}\n</stockpile_memory>`;
+function profileOneLiner(profile) {
+    if (!profile) return '';
+    const line = profile.split('\n').map(x => x.trim()).find(x => x && !x.startsWith('#'));
+    return line ? line.slice(0, 80) : '';
 }
 
-/** Record of the most recent generation, shown in the UI as proof of injection. */
+/**
+ * Assemble the <cast_memory> block. Pure given a token estimator.
+ * Sections: world (setting + applied world memory), on-stage characters
+ * (profile always; memories only for entries covering hidden history),
+ * and the roster (always, so the main model can self-correct presence).
+ */
+async function assembleBlock(store, budgetTokens) {
+    if (!store) return '';
+    const sections = [];
+
+    // Roster — always present, cheap, and the model's presence reference.
+    const names = characterNames(store);
+    if (names.length) {
+        const roster = names.map(n => {
+            const ch = store.characters[n];
+            const one = profileOneLiner(ch.profile);
+            return `- ${n} — ${ch.present ? 'ON STAGE' : 'off stage'}${one ? ` — ${one}` : ''}`;
+        }).join('\n');
+        sections.push({ key: 'roster', text: `## Cast roster\n${roster}`, priority: 0 });
+    }
+
+    // World setting from blocks — static reference, always included.
+    if (store.worldSetting) {
+        sections.push({ key: 'worldSetting', text: `## World\n${store.worldSetting}`, priority: 1 });
+    }
+
+    // World memory covering hidden history only.
+    const worldMem = [];
+    if (store.worldLongTerm) worldMem.push(store.worldLongTerm);
+    for (const e of store.worldEntries) {
+        if (e.end <= store.appliedUpTo) worldMem.push(e.text);
+    }
+    if (worldMem.length) {
+        sections.push({ key: 'worldMemory', text: `## World memory (events so far)\n${worldMem.join('\n')}`, priority: 2 });
+    }
+
+    // On-stage characters: profile + their own memories of hidden history.
+    for (const name of presentNames(store)) {
+        const ch = store.characters[name];
+        const parts = [`### ${name}`];
+        if (ch.profile) parts.push(ch.profile);
+        const mems = [];
+        if (ch.longTerm) mems.push(ch.longTerm);
+        for (const m of ch.memories) {
+            if (m.end <= store.appliedUpTo) mems.push(m.text);
+        }
+        if (mems.length) parts.push(`What ${name} remembers:\n${mems.join('\n')}`);
+        sections.push({ key: `char:${name}`, text: parts.join('\n'), priority: 3 });
+    }
+
+    // Off-stage characters keep only long-term memory in the prompt when
+    // budget allows — they are not acting now, but their past still colors
+    // the world. (Their recent memories return when they log back in.)
+    for (const name of names) {
+        const ch = store.characters[name];
+        if (ch.present) continue;
+        if (!ch.longTerm) continue;
+        sections.push({ key: `offstage:${name}`, text: `### ${name} (off stage)\n${ch.longTerm}`, priority: 4 });
+    }
+
+    if (sections.length === 0) return '';
+
+    sections.sort((a, b) => a.priority - b.priority);
+    const header = '<cast_memory>\n[Maintained records. Each character knows ONLY what is in their own memory below — never let a character act on events they did not witness. The roster shows who is on stage right now.]';
+    let out = header;
+    let used = await estimateTextTokens(header);
+    for (const sec of sections) {
+        const t = await estimateTextTokens(sec.text);
+        if (sec.priority <= 1) {
+            // Roster and world setting are structural: always include.
+            out += `\n\n${sec.text}`;
+            used += t;
+            continue;
+        }
+        if (used + t > budgetTokens && out !== header) {
+            // Try a truncated version for character sections before skipping.
+            if (sec.key.startsWith('char:') && used < budgetTokens) {
+                const room = Math.max(0, (budgetTokens - used) * 2); // ~2 chars/token
+                if (room > 200) out += `\n\n${sec.text.slice(0, room)}`;
+            }
+            continue;
+        }
+        out += `\n\n${sec.text}`;
+        used += t;
+    }
+    if (out === header) return '';
+    return out + '\n</cast_memory>';
+}
+
 let lastGen = { at: 0, included: false, type: '' };
 
-globalThis.stockpileMemoryInterceptor = async function (chatArray, _contextSize, _abort, type) {
+globalThis.castMemoryInterceptor = async function (chatArray, _contextSize, _abort, type) {
     try {
         lastGen = { at: Date.now(), included: false, type: String(type || '') };
         const s = getSettings();
         if (!s.enabled) return;
         if (type === 'quiet' || type === 'impersonate') return;
         const store = getStore();
-        if (!store || store.appliedUpTo < 0) return;
-        const block = assembleBlock(store);
+        if (!store) return;
+        const block = await assembleBlock(store, s.memoryBudgetTokens + 800); // +800: roster/setting headroom
         if (!block) return;
-
         chatArray.splice(0, 0, {
-            name: 'Stockpile Memory',
+            name: 'Cast Memory',
             is_user: false,
             is_system: false,
             send_date: Date.now(),
@@ -594,19 +996,15 @@ globalThis.stockpileMemoryInterceptor = async function (chatArray, _contextSize,
 
 async function backgroundCycle() {
     const s = getSettings();
-    if (!s.enabled || isWorking) { updateUI(); return; }
-    isWorking = true;
+    if (!s.enabled) { updateUI(); return; }
     try {
-        await stockpileOneBatch();
+        processNewBlocks();
+        await maybeWriteScene(false);
         await estimateChatTokens();
-        if (s.autoApply) await maybeApply();
-        await maybeConsolidate();
     } catch (e) {
         warn('background cycle error:', e);
-    } finally {
-        isWorking = false;
-        updateUI();
     }
+    updateUI();
 }
 
 function clampStoreToChat() {
@@ -615,11 +1013,19 @@ function clampStoreToChat() {
     if (!store || !chat) return;
     const maxIdx = chat.length - 1;
     let changed = false;
-    const before = store.items.length;
-    store.items = store.items.filter(it => it.start <= maxIdx);
-    if (store.items.length !== before) changed = true;
-    if (store.summarizedUpTo > maxIdx) { store.summarizedUpTo = maxIdx; changed = true; }
-    if (store.appliedUpTo > store.summarizedUpTo) { store.appliedUpTo = store.summarizedUpTo; changed = true; }
+    for (const k of ['parsedUpTo', 'writtenUpTo', 'appliedUpTo']) {
+        if (store[k] > maxIdx) { store[k] = maxIdx; changed = true; }
+    }
+    store.presence = store.presence.filter(p => p.index <= maxIdx);
+    for (const ch of Object.values(store.characters)) {
+        const before = ch.memories.length;
+        ch.memories = ch.memories.filter(m => m.start <= maxIdx);
+        if (ch.memories.length !== before) changed = true;
+    }
+    const wb = store.worldEntries.length;
+    store.worldEntries = store.worldEntries.filter(e => e.start <= maxIdx);
+    if (store.worldEntries.length !== wb) changed = true;
+    recomputePresence(store);
     if (changed) saveStore();
 }
 
@@ -630,85 +1036,62 @@ function onMessageReceived() {
 function onChatChanged() {
     setTimeout(async () => {
         clampStoreToChat();
+        processNewBlocks();
         markAppliedMessages(); // ignore flags don't survive a reload — re-assert
         await estimateChatTokens();
         updateUI();
     }, 150);
 }
 
-async function clearMemory() {
-    const store = getStore();
-    if (!store) return;
-    store.items = [];
-    store.summarizedUpTo = -1;
-    store.appliedUpTo = -1;
+async function clearAllData() {
+    const ctx = SillyTavern.getContext();
+    if (!ctx.chatMetadata) return;
     unmarkAllMessages();
+    ctx.chatMetadata[MODULE] = emptyStore();
     saveStore();
-    try { await SillyTavern.getContext().saveChat(); } catch (e) { /* noop */ }
+    try { await ctx.saveChat(); } catch (e) { /* noop */ }
     updateUI();
-    toastr.success('Stockpile Memory cleared for this chat.', 'Stockpile Memory');
+    toastr.success('Cast Memory のデータを全て消去しました', 'Cast Memory');
 }
 
-// ─── UI: floating button + summary sheet ─────────────────────────────────────
+// ─── UI: floating button + sheet ─────────────────────────────────────────────
 
 const RING_C = 2 * Math.PI * 20;
 
-let smSheetEl = null;
-let smPopupOpen = false;
+let cmSheetEl = null;
+let cmPopupOpen = false;
+let cmTab = 'cast';           // 'cast' | 'world' | 'ops'
+let cmSelectedChar = null;    // character name open in detail view
 
 function buildFabAndSheet() {
     buildSheetContent();
-    if (document.getElementById('sm-fab')) return;
+    if (document.getElementById('cm-fab')) return;
 
     const fab = document.createElement('div');
-    fab.id = 'sm-fab';
-    fab.title = 'Stockpile Memory';
-    // Critical styles are inlined so the button is visible even if style.css
-    // fails to load or is overridden by a theme.
-    // Position is anchored from the top-left with viewport units, never with
-    // bottom/right: ST sets perspective/transform on <html>, which makes it
-    // the containing block for fixed elements, and on the phone layout that
-    // block collapses so bottom-anchored elements render above the screen.
+    fab.id = 'cm-fab';
+    fab.title = 'Cast Memory';
+    // Position is anchored from the top-left with viewport units, never
+    // bottom/right: ST sets perspective/transform on <html>, making it the
+    // containing block for fixed elements; on the phone layout that block
+    // collapses and bottom-anchored elements render above the screen.
     fab.style.cssText = 'position:fixed;left:calc(100vw - 66px);top:calc(100vh - 148px);top:calc(100dvh - 148px);width:52px;height:52px;'
         + 'border-radius:50%;background:#22242c;box-shadow:0 2px 10px rgba(0,0,0,0.5);'
         + 'z-index:2147483647;display:block;visibility:visible;opacity:1;'
         + 'cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none;';
     fab.innerHTML = `
-        <svg viewBox="0 0 48 48" class="sm-ring-svg" style="position:absolute;inset:2px;width:48px;height:48px;transform:rotate(-90deg);pointer-events:none">
-            <circle class="sm-ring-bg" cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="3.5"></circle>
-            <circle class="sm-ring-fg" cx="24" cy="24" r="20" fill="none" stroke="#7bc47f" stroke-width="3.5" stroke-linecap="round"></circle>
+        <svg viewBox="0 0 48 48" class="cm-ring-svg" style="position:absolute;inset:2px;width:48px;height:48px;transform:rotate(-90deg);pointer-events:none">
+            <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="3.5"></circle>
+            <circle class="cm-ring-fg" cx="24" cy="24" r="20" fill="none" stroke="#7bc47f" stroke-width="3.5" stroke-linecap="round"></circle>
         </svg>
-        <span class="sm-fab-emoji" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:22px;pointer-events:none">🧠</span>
-        <span class="sm-fab-badge" style="display:none;position:absolute;top:-2px;right:-2px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#e0a458;color:#1a1a1a;font-size:12px;font-weight:700;align-items:center;justify-content:center;pointer-events:none"></span>`;
+        <span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:22px;pointer-events:none">🎭</span>
+        <span class="cm-fab-badge" style="display:none;position:absolute;top:-2px;right:-2px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#7bc47f;color:#1a1a1a;font-size:12px;font-weight:700;align-items:center;justify-content:center;pointer-events:none"></span>`;
     document.body.appendChild(fab);
     applyFabPosition();
     bindFabDrag(fab);
-
-+ "'''" + ""}
-
-// The summary sheet is a plain content element shown through SillyTavern's
-// own Popup API. (A custom position:fixed sheet was displaced by exactly
-// one viewport height on the user's phone — ST's popup system is the
-// mobile-safe way to show overlay UI.)
-function buildSheetContent() {
-    if (smSheetEl) return smSheetEl;
-    const el = document.createElement('div');
-    el.className = 'sm-sheet-content';
-    el.innerHTML = `
-        <div class="sm-sheet-status"></div>
-        <div class="sm-sheet-actions">
-            <button class="sm-btn sm-act-apply" type="button">今すぐ反映</button>
-            <button class="sm-btn sm-act-stockpile" type="button">要約を進める</button>
-            <button class="sm-btn sm-act-clear sm-btn-danger" type="button">全てリセット</button>
-        </div>
-        <div class="sm-list"></div>`;
-    bindListEvents(el);
-    smSheetEl = el;
-    return el;
 }
 
 function applyFabPosition() {
-    const fab = document.getElementById('sm-fab');
+    const fab = document.getElementById('cm-fab');
     if (!fab) return;
     const s = getSettings();
     if (Number.isFinite(s.iconLeft) && Number.isFinite(s.iconTop)) {
@@ -723,15 +1106,10 @@ function applyFabPosition() {
             fab.style.bottom = 'auto';
             return;
         }
-        // Saved position is outside this viewport (e.g. saved on another
-        // screen size, or a glitched drag): discard it.
         delete s.iconLeft;
         delete s.iconTop;
         saveSettings();
     }
-    // Default spot: bottom-right, but expressed as a top-left anchor with
-    // viewport units (see buildFabAndSheet — bottom anchoring breaks on the
-    // phone layout because of ST's transformed <html> containing block).
     fab.style.left = 'calc(100vw - 66px)';
     fab.style.top = 'calc(100vh - 148px)';
     fab.style.top = 'calc(100dvh - 148px)';
@@ -741,7 +1119,6 @@ function applyFabPosition() {
 
 function bindFabDrag(fab) {
     let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false, moved = false;
-
     fab.addEventListener('pointerdown', (e) => {
         const rect = fab.getBoundingClientRect();
         startX = e.clientX; startY = e.clientY;
@@ -779,14 +1156,14 @@ function bindFabDrag(fab) {
 }
 
 function buildWandMenuEntry() {
-    if (document.getElementById('sm-wand-entry')) return;
+    if (document.getElementById('cm-wand-entry')) return;
     const menu = document.getElementById('extensionsMenu');
     if (!menu) return;
     const entry = document.createElement('div');
-    entry.id = 'sm-wand-entry';
+    entry.id = 'cm-wand-entry';
     entry.className = 'list-group-item flex-container flexGap5';
     entry.style.cursor = 'pointer';
-    entry.innerHTML = '<div class="fa-solid fa-brain extensionsMenuExtensionButton"></div><span>Stockpile Memory</span>';
+    entry.innerHTML = '<div class="fa-solid fa-masks-theater extensionsMenuExtensionButton"></div><span>Cast Memory</span>';
     entry.addEventListener('click', () => {
         openSheet();
         const btn = document.getElementById('extensionsMenuButton');
@@ -795,25 +1172,59 @@ function buildWandMenuEntry() {
     menu.appendChild(entry);
 }
 
+// The sheet is plain content shown through SillyTavern's own Popup API —
+// the mobile-safe way to show overlay UI in ST (custom position:fixed
+// sheets are displaced by ST's transformed <html> containing block).
+function buildSheetContent() {
+    if (cmSheetEl) return cmSheetEl;
+    const el = document.createElement('div');
+    el.className = 'cm-sheet-content';
+    el.innerHTML = `
+        <div class="cm-sheet-status"></div>
+        <div class="cm-tabs">
+            <button class="cm-tab" type="button" data-act="tab" data-tab="cast">🎭 キャラクター</button>
+            <button class="cm-tab" type="button" data-act="tab" data-tab="world">🌍 ワールド</button>
+            <button class="cm-tab" type="button" data-act="tab" data-tab="ops">⚙️ 操作</button>
+        </div>
+        <div class="cm-view cm-view-cast"></div>
+        <div class="cm-view cm-view-world" hidden></div>
+        <div class="cm-view cm-view-ops" hidden>
+            <div class="cm-ops-btns">
+                <button class="cm-btn" type="button" data-act="scene-close">🎬 場面を締めて記憶を書く</button>
+                <button class="cm-btn" type="button" data-act="unapply">↩️ 反映を解除（原文を全部戻す）</button>
+                <button class="cm-btn cm-btn-danger" type="button" data-act="clear">🗑 全データを消去</button>
+            </div>
+            <div class="cm-addchar">
+                <div class="cm-addchar-title">キャラクターを手動で追加</div>
+                <input class="cm-addchar-name text_pole" type="text" placeholder="名前">
+                <button class="cm-btn" type="button" data-act="char-add">追加</button>
+            </div>
+            <div class="cm-ops-note">記憶の書き込みは「全員ログアウトした場面の終わり」か、未書込分が設定トークンを超えた時に自動でも行われます。書けていないメッセージは絶対に隠れません。</div>
+        </div>`;
+    el.addEventListener('click', onSheetClick);
+    cmSheetEl = el;
+    return el;
+}
+
 function openSheet() {
-    if (smPopupOpen) return;
+    if (cmPopupOpen) return;
     const el = buildSheetContent();
     updateUI();
     try {
         const ctx = SillyTavern.getContext();
-        smPopupOpen = true;
+        cmPopupOpen = true;
         const popup = new ctx.Popup(el, ctx.POPUP_TYPE.TEXT, '', {
             wide: true,
             large: true,
             okButton: '閉じる',
             allowVerticalScrolling: true,
-            onClose: () => { smPopupOpen = false; },
+            onClose: () => { cmPopupOpen = false; },
         });
         popup.show();
     } catch (e) {
-        smPopupOpen = false;
+        cmPopupOpen = false;
         noteError('openSheet/popup', e);
-        toastr.error('Stockpile Memory: ポップアップを開けませんでした。');
+        toastr.error('Cast Memory: ポップアップを開けませんでした。');
     }
 }
 
@@ -824,138 +1235,348 @@ function formatDate(ts) {
     } catch (e) { return ''; }
 }
 
-function originalHtml(item) {
+/** Render stored markdown the same way ST renders message text. */
+function renderMd(text, name) {
+    if (!text) return '';
+    try {
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.messageFormatting === 'function') {
+            return ctx.messageFormatting(text, name || '', false, false, 9999);
+        }
+    } catch (e) { /* fall through */ }
+    return escapeHtml(text).replace(/\n/g, '<br>');
+}
+
+function originalHtml(start, end) {
     const { chat, name1, name2 } = SillyTavern.getContext();
     const parts = [];
-    for (let i = item.start; i <= item.end && i < chat.length; i++) {
+    for (let i = start; i <= end && i < chat.length; i++) {
         const m = chat[i];
         if (!m || !m.mes) continue;
         const name = m.name || (m.is_user ? name1 : name2);
-        parts.push(`<div class="sm-orig-msg"><div class="sm-orig-name">${escapeHtml(name)}</div><div class="sm-orig-text">${escapeHtml(m.mes)}</div></div>`);
+        parts.push(`<div class="cm-orig-msg"><div class="cm-orig-name">${escapeHtml(name)}</div><div class="cm-orig-text">${escapeHtml(m.mes)}</div></div>`);
     }
-    return parts.join('') || '<div class="sm-empty">原文が見つかりませんでした</div>';
+    return parts.join('') || '<div class="cm-empty">原文が見つかりませんでした</div>';
 }
 
-function renderList() {
-    const list = smSheetEl ? smSheetEl.querySelector('.sm-list') : null;
-    if (!list) return;
+function encName(name) { return encodeURIComponent(name); }
+function decName(v) { try { return decodeURIComponent(v || ''); } catch (e) { return v || ''; } }
+
+// ─── Sheet rendering ─────────────────────────────────────────────────────────
+
+function entryHtml(entry, kind, name) {
+    const live = entry.end <= (getStore()?.appliedUpTo ?? -1);
+    const badge = live
+        ? '<span class="cm-badge cm-badge-live">✅ 反映中</span>'
+        : '<span class="cm-badge cm-badge-stock">📦 記録済み</span>';
+    return `
+    <div class="cm-entry" data-kind="${kind}" data-id="${entry.id}" data-name="${name ? encName(name) : ''}">
+        <div class="cm-entry-head">
+            <span class="cm-entry-meta">msg ${entry.start}–${entry.end} · ${formatDate(entry.ts)}</span>${badge}
+        </div>
+        <div class="cm-entry-text mes_text">${renderMd(entry.text, name || '')}</div>
+        <div class="cm-entry-btns">
+            <button class="cm-btn cm-btn-small" type="button" data-act="entry-orig">原文を見る</button>
+            <button class="cm-btn cm-btn-small cm-btn-danger" type="button" data-act="entry-del">この記憶を削除</button>
+        </div>
+        <div class="cm-orig" hidden></div>
+    </div>`;
+}
+
+function renderCastView() {
+    const view = cmSheetEl ? cmSheetEl.querySelector('.cm-view-cast') : null;
+    if (!view) return;
     const store = getStore();
-    if (!store || store.items.length === 0) {
-        list.innerHTML = '<div class="sm-empty">このチャットの要約はまだありません</div>';
+    if (!store) { view.innerHTML = '<div class="cm-empty">チャットが開かれていません</div>'; return; }
+
+    if (cmSelectedChar && store.characters[cmSelectedChar]) {
+        const name = cmSelectedChar;
+        const ch = store.characters[name];
+        const memHtml = ch.memories.length
+            ? ch.memories.map(m => entryHtml(m, 'char', name)).join('')
+            : '<div class="cm-empty">このキャラクターの記憶はまだありません</div>';
+        const longTermHtml = ch.longTerm
+            ? `<div class="cm-section-title">長期記憶（統合済み）</div><div class="cm-md mes_text">${renderMd(ch.longTerm, name)}</div>`
+            : '';
+        view.innerHTML = `
+            <div class="cm-detail-head">
+                <button class="cm-btn cm-btn-small" type="button" data-act="char-back">← 一覧へ</button>
+                <span class="cm-detail-name">${escapeHtml(name)}</span>
+                <span class="cm-badge ${ch.present ? 'cm-badge-live' : 'cm-badge-stock'}">${ch.present ? '🟢 登場中' : '⚪ 退場中'}</span>
+            </div>
+            <div class="cm-detail-btns">
+                <button class="cm-btn cm-btn-small" type="button" data-act="presence-toggle" data-name="${encName(name)}">${ch.present ? 'ログアウトさせる' : 'ログインさせる'}</button>
+                <button class="cm-btn cm-btn-small cm-btn-danger" type="button" data-act="char-del" data-name="${encName(name)}">キャラを削除</button>
+            </div>
+            <div class="cm-section-title">プロフィール</div>
+            <div class="cm-md mes_text">${ch.profile ? renderMd(ch.profile, name) : '<span class="cm-empty">（未登録）</span>'}</div>
+            <div class="cm-editbox cm-profile-edit" hidden>
+                <textarea class="cm-edit-text text_pole" rows="8">${escapeHtml(ch.profile)}</textarea>
+                <div class="cm-entry-btns">
+                    <button class="cm-btn cm-btn-small" type="button" data-act="profile-save" data-name="${encName(name)}">保存</button>
+                    <button class="cm-btn cm-btn-small" type="button" data-act="profile-cancel">キャンセル</button>
+                </div>
+            </div>
+            <button class="cm-btn cm-btn-small" type="button" data-act="profile-edit">プロフィールを編集</button>
+            ${longTermHtml}
+            <div class="cm-section-title">記憶（${ch.memories.length}件）</div>
+            ${memHtml}`;
         return;
     }
-    let chapterNo = 0;
-    let seenChapter = false;
-    list.innerHTML = store.items.map((it, idx) => {
-        const isChapter = it.kind === 'chapter';
-        if (isChapter) { chapterNo++; seenChapter = true; }
-        const applied = it.end <= store.appliedUpTo;
-        const badge = applied
-            ? '<span class="sm-badge sm-badge-live">✅ 反映中</span>'
-            : '<span class="sm-badge sm-badge-stock">📦 備蓄中</span>';
-        const title = isChapter ? `📖 第${chapterNo}章` : '要約';
-        const covers = isChapter && it.covers ? `（${it.covers}件を統合）` : '';
-        const cls = ['sm-item', isChapter ? 'sm-item-chapter' : '', (!isChapter && seenChapter) ? 'sm-item-nested' : ''].join(' ');
+
+    const names = characterNames(store);
+    if (names.length === 0) {
+        view.innerHTML = '<div class="cm-empty">まだキャラクターが登録されていません。<br>モデルがキャラクター作成ブロックを出すか、「操作」タブから手動で追加できます。</div>';
+        return;
+    }
+    const sorted = [...names].sort((a, b) => {
+        const pa = store.characters[a].present ? 0 : 1;
+        const pb = store.characters[b].present ? 0 : 1;
+        return pa - pb || (store.characters[b].updated || 0) - (store.characters[a].updated || 0);
+    });
+    view.innerHTML = sorted.map(n => {
+        const ch = store.characters[n];
+        const one = profileOneLiner(ch.profile);
         return `
-        <div class="${cls}" data-idx="${idx}">
-            <div class="sm-item-head">
-                <span class="sm-item-title">${title}</span>${badge}
-                <span class="sm-item-meta">msg ${it.start}–${it.end}${covers} · ${formatDate(it.ts)}</span>
-            </div>
-            <div class="sm-item-text">${escapeHtml(it.text)}</div>
-            <div class="sm-item-detail" hidden>
-                <div class="sm-item-btns">
-                    <button class="sm-btn sm-orig-btn" type="button">原文を見る</button>
-                    <button class="sm-btn sm-edit-btn" type="button">編集する</button>
-                </div>
-                <div class="sm-orig" hidden></div>
-                <div class="sm-editbox" hidden>
-                    <textarea class="sm-edit-text" rows="4">${escapeHtml(it.text)}</textarea>
-                    <div class="sm-item-btns">
-                        <button class="sm-btn sm-save-btn" type="button">保存</button>
-                        <button class="sm-btn sm-cancel-btn" type="button">キャンセル</button>
-                    </div>
-                </div>
-            </div>
+        <div class="cm-char-row" data-act="char-open" data-name="${encName(n)}">
+            <span class="cm-char-dot">${ch.present ? '🟢' : '⚪'}</span>
+            <span class="cm-char-main">
+                <span class="cm-char-name">${escapeHtml(n)}</span>
+                <span class="cm-char-sub">${escapeHtml(one || 'プロフィール未登録')} · 記憶 ${ch.memories.length}件${ch.longTerm ? '＋長期' : ''}</span>
+            </span>
+            <span class="cm-char-arrow">›</span>
         </div>`;
     }).join('');
 }
 
-function bindListEvents(sheet) {
-    const list = sheet.querySelector('.sm-list');
-    list.addEventListener('click', async (e) => {
-        const itemEl = e.target.closest('.sm-item');
-        if (!itemEl) return;
-        const idx = parseInt(itemEl.dataset.idx, 10);
-        const store = getStore();
-        if (!store || !store.items[idx]) return;
-        const item = store.items[idx];
+function renderWorldView() {
+    const view = cmSheetEl ? cmSheetEl.querySelector('.cm-view-world') : null;
+    if (!view) return;
+    const store = getStore();
+    if (!store) { view.innerHTML = '<div class="cm-empty">チャットが開かれていません</div>'; return; }
+    const entries = store.worldEntries.length
+        ? store.worldEntries.map(e => entryHtml(e, 'world', '')).join('')
+        : '<div class="cm-empty">ワールド記憶はまだありません</div>';
+    view.innerHTML = `
+        <div class="cm-section-title">ワールド情報（設定）</div>
+        <div class="cm-md mes_text">${store.worldSetting ? renderMd(store.worldSetting, '') : '<span class="cm-empty">（未登録）</span>'}</div>
+        <div class="cm-editbox cm-world-edit" hidden>
+            <textarea class="cm-edit-text text_pole" rows="8">${escapeHtml(store.worldSetting)}</textarea>
+            <div class="cm-entry-btns">
+                <button class="cm-btn cm-btn-small" type="button" data-act="world-save">保存</button>
+                <button class="cm-btn cm-btn-small" type="button" data-act="world-cancel">キャンセル</button>
+            </div>
+        </div>
+        <button class="cm-btn cm-btn-small" type="button" data-act="world-edit">ワールド情報を編集</button>
+        ${store.worldLongTerm ? `<div class="cm-section-title">ワールド長期記憶（統合済み）</div><div class="cm-md mes_text">${renderMd(store.worldLongTerm, '')}</div>` : ''}
+        <div class="cm-section-title">ワールド記憶（${store.worldEntries.length}件）</div>
+        ${entries}`;
+}
 
-        if (e.target.closest('.sm-item-head')) {
-            const detail = itemEl.querySelector('.sm-item-detail');
-            detail.hidden = !detail.hidden;
-            return;
+function renderSheet() {
+    if (!cmSheetEl) return;
+    cmSheetEl.querySelectorAll('.cm-tab').forEach(t => {
+        t.classList.toggle('cm-tab-active', t.dataset.tab === cmTab);
+    });
+    const cast = cmSheetEl.querySelector('.cm-view-cast');
+    const world = cmSheetEl.querySelector('.cm-view-world');
+    const ops = cmSheetEl.querySelector('.cm-view-ops');
+    if (cast) cast.hidden = cmTab !== 'cast';
+    if (world) world.hidden = cmTab !== 'world';
+    if (ops) ops.hidden = cmTab !== 'ops';
+    renderCastView();
+    renderWorldView();
+    const status = cmSheetEl.querySelector('.cm-sheet-status');
+    if (status) status.textContent = statusText();
+}
+
+// ─── Sheet actions ───────────────────────────────────────────────────────────
+
+async function onSheetClick(e) {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    const store = getStore();
+
+    if (act === 'tab') {
+        cmTab = btn.dataset.tab;
+        renderSheet();
+        return;
+    }
+    if (!store) return;
+
+    switch (act) {
+        case 'char-open':
+            cmSelectedChar = decName(btn.dataset.name);
+            renderSheet();
+            break;
+        case 'char-back':
+            cmSelectedChar = null;
+            renderSheet();
+            break;
+        case 'presence-toggle': {
+            const name = decName(btn.dataset.name);
+            const ch = store.characters[name];
+            if (!ch) break;
+            ch.present = !ch.present;
+            ch.updated = Date.now();
+            const { chat } = SillyTavern.getContext();
+            store.presence.push({ index: Math.max(0, (chat?.length || 1) - 1), name, action: ch.present ? 'login' : 'logout' });
+            saveStore();
+            renderSheet();
+            updateFab();
+            break;
         }
-        if (e.target.closest('.sm-orig-btn')) {
-            const orig = itemEl.querySelector('.sm-orig');
+        case 'char-del': {
+            const name = decName(btn.dataset.name);
+            if (!confirm(`キャラクター「${name}」とその記憶を全て削除しますか？`)) break;
+            delete store.characters[name];
+            store.presence = store.presence.filter(p => p.name !== name);
+            if (cmSelectedChar === name) cmSelectedChar = null;
+            saveStore();
+            renderSheet();
+            break;
+        }
+        case 'char-add': {
+            const input = cmSheetEl.querySelector('.cm-addchar-name');
+            const name = (input?.value || '').trim();
+            if (!name) { toastr.warning('名前を入力してください', 'Cast Memory'); break; }
+            getCharacter(store, name);
+            if (input) input.value = '';
+            saveStore();
+            cmSelectedChar = name;
+            cmTab = 'cast';
+            renderSheet();
+            toastr.success(`「${name}」を追加しました`, 'Cast Memory');
+            break;
+        }
+        case 'profile-edit':
+            cmSheetEl.querySelector('.cm-profile-edit').hidden = false;
+            break;
+        case 'profile-cancel':
+            cmSheetEl.querySelector('.cm-profile-edit').hidden = true;
+            break;
+        case 'profile-save': {
+            const name = decName(btn.dataset.name);
+            const ta = cmSheetEl.querySelector('.cm-profile-edit .cm-edit-text');
+            const ch = store.characters[name];
+            if (ch && ta) {
+                ch.profile = ta.value.trim();
+                ch.updated = Date.now();
+                saveStore();
+                toastr.success('プロフィールを保存しました', 'Cast Memory');
+            }
+            renderSheet();
+            break;
+        }
+        case 'world-edit':
+            cmSheetEl.querySelector('.cm-world-edit').hidden = false;
+            break;
+        case 'world-cancel':
+            cmSheetEl.querySelector('.cm-world-edit').hidden = true;
+            break;
+        case 'world-save': {
+            const ta = cmSheetEl.querySelector('.cm-world-edit .cm-edit-text');
+            if (ta) {
+                store.worldSetting = ta.value.trim();
+                saveStore();
+                toastr.success('ワールド情報を保存しました', 'Cast Memory');
+            }
+            renderSheet();
+            break;
+        }
+        case 'entry-orig': {
+            const entryEl = btn.closest('.cm-entry');
+            const orig = entryEl ? entryEl.querySelector('.cm-orig') : null;
+            if (!orig) break;
             if (orig.hidden && !orig.dataset.loaded) {
-                orig.innerHTML = originalHtml(item);
-                orig.dataset.loaded = '1';
+                const kind = entryEl.dataset.kind;
+                const id = entryEl.dataset.id;
+                const name = decName(entryEl.dataset.name);
+                const entry = kind === 'world'
+                    ? store.worldEntries.find(x => x.id === id)
+                    : store.characters[name]?.memories.find(x => x.id === id);
+                if (entry) {
+                    orig.innerHTML = originalHtml(entry.start, entry.end);
+                    orig.dataset.loaded = '1';
+                }
             }
             orig.hidden = !orig.hidden;
-            return;
+            break;
         }
-        if (e.target.closest('.sm-edit-btn')) {
-            itemEl.querySelector('.sm-editbox').hidden = false;
-            return;
-        }
-        if (e.target.closest('.sm-cancel-btn')) {
-            itemEl.querySelector('.sm-editbox').hidden = true;
-            return;
-        }
-        if (e.target.closest('.sm-save-btn')) {
-            const ta = itemEl.querySelector('.sm-edit-text');
-            const newText = ta.value.trim();
-            if (newText && newText !== item.text) {
-                item.text = newText;
-                _itemTokenCache.delete(item.text);
-                saveStore();
-                toastr.success('要約を更新しました', 'Stockpile Memory');
+        case 'entry-del': {
+            const entryEl = btn.closest('.cm-entry');
+            if (!entryEl) break;
+            if (!confirm('この記憶を削除しますか？（対応する原文は既に隠れている場合、情報が失われます）')) break;
+            const kind = entryEl.dataset.kind;
+            const id = entryEl.dataset.id;
+            const name = decName(entryEl.dataset.name);
+            if (kind === 'world') {
+                store.worldEntries = store.worldEntries.filter(x => x.id !== id);
+            } else if (store.characters[name]) {
+                store.characters[name].memories = store.characters[name].memories.filter(x => x.id !== id);
             }
-            renderList();
-            updateUI();
-            return;
+            saveStore();
+            renderSheet();
+            break;
         }
-    });
+        case 'scene-close': {
+            if (isWorking) { toastr.info('作業中です…', 'Cast Memory'); break; }
+            toastr.info('場面を締めて記憶を書いています…', 'Cast Memory');
+            const ok = await maybeWriteScene(true);
+            if (ok) toastr.success('記憶を書き込みました', 'Cast Memory');
+            else if (lastWriterError) toastr.error(`書き込みエラー: ${lastWriterError}`, 'Cast Memory');
+            else toastr.info('書く対象がありませんでした', 'Cast Memory');
+            renderSheet();
+            break;
+        }
+        case 'unapply': {
+            unapplyAll();
+            try { await SillyTavern.getContext().saveChat(); } catch (err) { /* noop */ }
+            toastr.success('反映を解除しました。原文が全てプロンプトに戻ります', 'Cast Memory');
+            renderSheet();
+            break;
+        }
+        case 'clear': {
+            if (!confirm('Cast Memory の全データ（キャラ・記憶・ワールド）を消去しますか？原文は全て戻ります。')) break;
+            await clearAllData();
+            cmSelectedChar = null;
+            renderSheet();
+            break;
+        }
+    }
 }
+
+// ─── Status / FAB ────────────────────────────────────────────────────────────
 
 function statusText() {
     const store = getStore();
     if (!store) return 'チャットが開かれていません';
-    const applied = appliedItems(store).length;
-    const stock = stockpiledItems(store).length;
+    const names = characterNames(store);
+    const present = presentNames(store).length;
     const tok = lastTokenEstimate >= 0 ? `履歴 ≈ ${lastTokenEstimate} tok` : '履歴 ≈ ? tok';
-    const gen = !lastGen.at ? '前回生成: —' : (lastGen.included ? '前回生成: 要約あり ✓' : '前回生成: 要約なし');
-    const work = isWorking ? ' · 要約を作成中…' : '';
-    const err = lastSummarizerError ? ` · ⚠️ ${lastSummarizerError}` : '';
-    return `${tok} ／ 反映済み ${applied}件 ／ 備蓄中 ${stock}件 ／ ${gen}${work}${err}`;
+    const unwritten = lastUnwrittenEstimate >= 0 ? `未書込 ≈ ${lastUnwrittenEstimate} tok` : '';
+    const gen = !lastGen.at ? '前回生成: —' : (lastGen.included ? '前回生成: 記録あり ✓' : '前回生成: 記録なし');
+    const work = isWorking ? ' · 記憶を作成中…' : '';
+    const err = lastWriterError ? ` · ⚠️ ${lastWriterError}` : '';
+    return `${tok}${unwritten ? ` ／ ${unwritten}` : ''} ／ キャラ ${names.length}（登場中 ${present}） ／ 書込済 msg ${store.writtenUpTo}・反映済 msg ${store.appliedUpTo} ／ ${gen}${work}${err}`;
 }
 
 function updateFab() {
-    const fab = document.getElementById('sm-fab');
+    const fab = document.getElementById('cm-fab');
     if (!fab) return;
     const s = getSettings();
-    const ring = fab.querySelector('.sm-ring-fg');
+    const ring = fab.querySelector('.cm-ring-fg');
     if (ring) {
-        const frac = (s.applyThresholdTokens > 0 && lastTokenEstimate >= 0)
-            ? Math.min(1, lastTokenEstimate / s.applyThresholdTokens) : 0;
+        const frac = (s.sceneThresholdTokens > 0 && lastUnwrittenEstimate >= 0)
+            ? Math.min(1, lastUnwrittenEstimate / s.sceneThresholdTokens) : 0;
         ring.style.strokeDasharray = String(RING_C);
         ring.style.strokeDashoffset = String(RING_C * (1 - frac));
         ring.style.stroke = frac >= 1 ? '#e06c5f' : (frac >= 0.7 ? '#e0a458' : '#7bc47f');
     }
-    const badge = fab.querySelector('.sm-fab-badge');
+    const badge = fab.querySelector('.cm-fab-badge');
     const store = getStore();
-    const n = store ? stockpiledItems(store).length : 0;
+    const n = store ? presentNames(store).length : 0;
     if (badge) {
         badge.style.display = n > 0 ? 'flex' : 'none';
         badge.textContent = String(n);
@@ -966,45 +1587,24 @@ function updateFab() {
 function updateUI() {
     try {
         updateFab();
-        const text = statusText();
-        const sheetStatus = smSheetEl ? smSheetEl.querySelector('.sm-sheet-status') : null;
-        if (sheetStatus) sheetStatus.textContent = text;
-        const panelStatus = document.getElementById('sm_status');
-        if (panelStatus) panelStatus.textContent = text;
-        if (smSheetEl) renderList();
+        if (cmSheetEl) renderSheet();
+        const panelStatus = document.getElementById('cm_status');
+        if (panelStatus) panelStatus.textContent = statusText();
     } catch (e) { /* UI is best-effort */ }
 }
 
-// ─── Actions (shared by sheet + settings panel) ──────────────────────────────
+// ─── Settings panel actions ──────────────────────────────────────────────────
 
 function bindActions() {
-    $(document).on('click', '.sm-act-open', function () {
+    $(document).on('click', '.cm-act-open', function () {
         openSheet();
-    });
-    $(document).on('click', '.sm-act-apply', async function () {
-        if (applyNow(true)) {
-            await maybeConsolidate();
-        }
-        updateUI();
-    });
-    $(document).on('click', '.sm-act-stockpile', async function () {
-        if (isWorking) { toastr.info('Working… please wait.', 'Stockpile Memory'); return; }
-        toastr.info('Stockpiling summaries in the background…', 'Stockpile Memory');
-        await stockpileAll();
-        if (lastSummarizerError) {
-            toastr.error(`Summarizer error: ${lastSummarizerError}`, 'Stockpile Memory');
-        }
-    });
-    $(document).on('click', '.sm-act-clear', async function () {
-        if (!confirm('Clear ALL Stockpile Memory summaries for this chat? Original messages will be sent to the LLM again.')) return;
-        await clearMemory();
     });
 }
 
 // ─── Settings panel ──────────────────────────────────────────────────────────
 
 function populateProfiles() {
-    const select = document.getElementById('sm_profile');
+    const select = document.getElementById('cm_profile');
     if (!select) return;
     try {
         const svc = SillyTavern.getContext().ConnectionManagerRequestService;
@@ -1018,7 +1618,7 @@ function populateProfiles() {
 
 function syncSourcePanels() {
     const s = getSettings();
-    const map = { profile: 'sm_profile_wrap', openai: 'sm_openai_wrap', ollama: 'sm_ollama_wrap' };
+    const map = { profile: 'cm_profile_wrap', openai: 'cm_openai_wrap', ollama: 'cm_ollama_wrap' };
     for (const [key, id] of Object.entries(map)) {
         const el = document.getElementById(id);
         if (el) el.style.display = (s.connectionSource === key) ? 'block' : 'none';
@@ -1030,22 +1630,22 @@ function syncSettingsForm() {
     const s = getSettings();
     const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
     const chk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
-    chk('sm_enabled', s.enabled);
-    chk('sm_auto_apply', s.autoApply);
-    set('sm_verbatim', s.verbatimTurns);
-    set('sm_batch', s.turnsPerSummary);
-    set('sm_threshold', s.applyThresholdTokens);
-    set('sm_budget', s.memoryBudgetTokens);
-    set('sm_resp_len', s.summarizerResponseLength);
-    set('sm_source', s.connectionSource);
-    set('sm_oai_url', s.openaiUrl);
-    set('sm_oai_key', s.openaiKey);
-    set('sm_oai_model', s.openaiModel);
-    set('sm_ollama_url', s.ollamaUrl);
-    set('sm_ollama_model', s.ollamaModel);
-    set('sm_sys_prompt', s.systemPrompt);
-    set('sm_user_prompt', s.userPrompt);
-    set('sm_consol_prompt', s.consolidateUserPrompt);
+    chk('cm_enabled', s.enabled);
+    set('cm_tail', s.keepTailMessages);
+    set('cm_threshold', s.sceneThresholdTokens);
+    set('cm_budget', s.memoryBudgetTokens);
+    set('cm_fold', s.foldCharThreshold);
+    set('cm_resp_len', s.summarizerResponseLength);
+    set('cm_source', s.connectionSource);
+    set('cm_oai_url', s.openaiUrl);
+    set('cm_oai_key', s.openaiKey);
+    set('cm_oai_model', s.openaiModel);
+    set('cm_ollama_url', s.ollamaUrl);
+    set('cm_ollama_model', s.ollamaModel);
+    set('cm_writer_sys', s.writerSystemPrompt);
+    set('cm_writer_user', s.writerUserPrompt);
+    set('cm_fold_user', s.foldUserPrompt);
+    set('cm_wfold_user', s.worldFoldUserPrompt);
     syncSourcePanels();
 }
 
@@ -1062,33 +1662,30 @@ function bindSettings() {
             saveSettings();
         });
     };
-    $(document).on('change', '#sm_enabled', function () {
+    $(document).on('change', '#cm_enabled', function () {
         getSettings().enabled = $(this).prop('checked');
         saveSettings(); updateUI();
     });
-    $(document).on('change', '#sm_auto_apply', function () {
-        getSettings().autoApply = $(this).prop('checked');
-        saveSettings();
-    });
-    num('sm_verbatim', 'verbatimTurns');
-    num('sm_batch', 'turnsPerSummary');
-    num('sm_threshold', 'applyThresholdTokens');
-    num('sm_budget', 'memoryBudgetTokens');
-    num('sm_resp_len', 'summarizerResponseLength');
-    txt('sm_oai_url', 'openaiUrl');
-    txt('sm_oai_key', 'openaiKey');
-    txt('sm_oai_model', 'openaiModel');
-    txt('sm_ollama_url', 'ollamaUrl');
-    txt('sm_ollama_model', 'ollamaModel');
-    txt('sm_sys_prompt', 'systemPrompt');
-    txt('sm_user_prompt', 'userPrompt');
-    txt('sm_consol_prompt', 'consolidateUserPrompt');
-    $(document).on('change', '#sm_source', function () {
+    num('cm_tail', 'keepTailMessages');
+    num('cm_threshold', 'sceneThresholdTokens');
+    num('cm_budget', 'memoryBudgetTokens');
+    num('cm_fold', 'foldCharThreshold');
+    num('cm_resp_len', 'summarizerResponseLength');
+    txt('cm_oai_url', 'openaiUrl');
+    txt('cm_oai_key', 'openaiKey');
+    txt('cm_oai_model', 'openaiModel');
+    txt('cm_ollama_url', 'ollamaUrl');
+    txt('cm_ollama_model', 'ollamaModel');
+    txt('cm_writer_sys', 'writerSystemPrompt');
+    txt('cm_writer_user', 'writerUserPrompt');
+    txt('cm_fold_user', 'foldUserPrompt');
+    txt('cm_wfold_user', 'worldFoldUserPrompt');
+    $(document).on('change', '#cm_source', function () {
         getSettings().connectionSource = $(this).val();
         saveSettings();
         syncSourcePanels();
     });
-    $(document).on('change', '#sm_profile', function () {
+    $(document).on('change', '#cm_profile', function () {
         getSettings().profileId = $(this).val();
         saveSettings();
     });
@@ -1096,36 +1693,56 @@ function bindSettings() {
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 
-jQuery(async () => {
-    const ctx = SillyTavern.getContext();
-    try {
-        const html = await ctx.renderExtensionTemplateAsync('third-party/Extension-StockpileMemory', 'settings');
-        $('#extensions_settings2').append(html);
-    } catch (e) {
-        warn('settings template failed to load:', e);
-    }
-    try { buildFabAndSheet(); } catch (e) { noteError('buildFabAndSheet', e); }
-    try { buildWandMenuEntry(); } catch (e) { noteError('buildWandMenuEntry', e); }
-    try { bindSettings(); } catch (e) { noteError('bindSettings', e); }
-    try { bindActions(); } catch (e) { noteError('bindActions', e); }
-    try { syncSettingsForm(); } catch (e) { noteError('syncSettingsForm', e); }
-    // Watchdog: if ST's own startup (or a theme/layout rebuild) removes the
-    // injected UI elements, recreate them. Runs for the first minute.
-    let smWatchTries = 0;
-    const smWatch = setInterval(() => {
-        smWatchTries++;
-        if (!document.getElementById('sm-fab')) {
-            try { buildFabAndSheet(); } catch (e) { noteError('watchdog/buildFabAndSheet', e); }
+function initCastMemory() {
+    jQuery(async () => {
+        const ctx = SillyTavern.getContext();
+        try {
+            const html = await ctx.renderExtensionTemplateAsync('third-party/Extension-CastMemory', 'settings');
+            $('#extensions_settings2').append(html);
+        } catch (e) {
+            warn('settings template failed to load:', e);
         }
-        if (!document.getElementById('sm-wand-entry')) {
-            try { buildWandMenuEntry(); } catch (e) { /* menu may not exist yet */ }
-        }
+        try { buildFabAndSheet(); } catch (e) { noteError('buildFabAndSheet', e); }
+        try { buildWandMenuEntry(); } catch (e) { noteError('buildWandMenuEntry', e); }
+        try { bindSettings(); } catch (e) { noteError('bindSettings', e); }
+        try { bindActions(); } catch (e) { noteError('bindActions', e); }
+        try { syncSettingsForm(); } catch (e) { noteError('syncSettingsForm', e); }
+        // Watchdog: recreate UI elements if ST's startup removes them.
+        let cmWatchTries = 0;
+        const cmWatch = setInterval(() => {
+            cmWatchTries++;
+            if (!document.getElementById('cm-fab')) {
+                try { buildFabAndSheet(); } catch (e) { noteError('watchdog/buildFabAndSheet', e); }
+            }
+            if (!document.getElementById('cm-wand-entry')) {
+                try { buildWandMenuEntry(); } catch (e) { /* menu may not exist yet */ }
+            }
+            reportDiag();
+            if (cmWatchTries >= 60) clearInterval(cmWatch);
+        }, 1000);
         reportDiag();
-        if (smWatchTries >= 60) clearInterval(smWatch);
-    }, 1000);
-    reportDiag();
-    ctx.eventSource.on(ctx.eventTypes.MESSAGE_RECEIVED, onMessageReceived);
-    ctx.eventSource.on(ctx.eventTypes.CHAT_CHANGED, onChatChanged);
-    onChatChanged();
-    log('initialized');
-});
+        const et = ctx.eventTypes;
+        ctx.eventSource.on(et.MESSAGE_RECEIVED, onMessageReceived);
+        ctx.eventSource.on(et.CHAT_CHANGED, onChatChanged);
+        if (et.MESSAGE_DELETED) ctx.eventSource.on(et.MESSAGE_DELETED, onChatChanged);
+        if (et.MESSAGE_EDITED) ctx.eventSource.on(et.MESSAGE_EDITED, onChatChanged);
+        if (et.MESSAGE_SWIPED) ctx.eventSource.on(et.MESSAGE_SWIPED, onChatChanged);
+        onChatChanged();
+        log('initialized');
+    });
+}
+
+if (typeof jQuery !== 'undefined' && typeof window !== 'undefined') {
+    initCastMemory();
+}
+
+// Node export for the logic test harness (no-op in the browser).
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        parseBlocks, stripBlocks, applyBlock, participantsForRange,
+        recomputePresence, parseWriterOutput, emptyStore, getCharacter,
+        presentNames, characterNames, entryBoundaries, profileOneLiner,
+        cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
+        getStore, getSettings, markAppliedMessages,
+    };
+}

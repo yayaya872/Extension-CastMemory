@@ -3,11 +3,11 @@
     "auto_update": true,
     "css": "style.css",
     "display_name": "Cast Memory",
-    "generate_interceptor": "stockpileMemoryInterceptor",
+    "generate_interceptor": "castMemoryInterceptor",
     "homePage": "https://github.com/yayaya872/Extension-CastMemory",
     "js": "index.js",
     "loading_order": 60,
     "optional": [],
     "requires": [],
-    "version": "1.1.1"
+    "version": "2.0.0"
 }

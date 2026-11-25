@@ -1,52 +1,84 @@
 # Cast Memory
 
-Long-term memory and character persistence for SillyTavern.
+Long-term memory and character persistence for SillyTavern roleplay.
 
-This is the merged edition of Stockpile Memory. The summary engine below
-is inherited unchanged; a character vault with its own storage and
-controlled injection will be added on top of it. The original
-Stockpile Memory repository stays frozen at v1.1.1.
+Each character keeps **their own memories** — only of events they were
+present for. Raw chat history sent to the model shrinks to the current
+scene plus a short tail; everything older reaches the model as
+per-character memories and world memory. A character who wasn't there
+doesn't know — information asymmetry is structural, not prompted.
 
-## How the summary engine works
+This repository is the merged edition built on Stockpile Memory
+(v1.1.1, kept frozen in its own repository).
 
-1. **Stockpile** — After each reply, a few old turns are summarized in the
-   background and stockpiled. The prompt is *not* touched, so the prompt
-   cache stays intact and the originals keep being sent word-for-word.
-2. **Apply** — When the visible chat history reaches a token threshold
-   (default 12,000), all stockpiled summaries are swapped in at once:
-   their source messages are excluded from the prompt (via SillyTavern's
-   ignore symbol) and the summary block is spliced into the exact chat
-   array being sent by a `generate_interceptor`. One cache break, at the
-   moment you chose.
-3. **Consolidate** — The injected summary block has a token budget
-   (default 3,000). When applied summaries grow past it, the oldest ones
-   are merged into a single "chapter" summary in the background, so total
-   memory stays bounded no matter how long the chat runs.
+## How it works
+
+1. **Presence (main model).** The story model declares who is on stage
+   with tiny HTML-comment blocks — login when a character enters,
+   logout when they leave, a profile block at first introduction. The
+   extension parses and strips them and keeps the roster. See
+   [PROMPT_RULES.md](PROMPT_RULES.md) for the block you paste into your
+   preset.
+2. **Memory writing (sub model).** When a scene closes (everyone
+   logged out), when unwritten history passes a token threshold, or on
+   a manual tap, a sub model of your choice (connection profile /
+   OpenAI-compatible / Ollama / main API) reads the scene and writes:
+   one subjective memory per participant, plus shared world-memory
+   entries — as JSON, stored per character.
+3. **Injection.** A `generate_interceptor` splices a `<cast_memory>`
+   block into the exact outgoing chat array: the roster (who is on
+   stage), world setting + world memory, and for each on-stage
+   character their profile and their own memories. Off-stage
+   characters contribute only folded long-term memory, within budget.
+4. **Hiding, safely.** Messages whose range is covered by written
+   memories are flagged with SillyTavern's ignore symbol and leave the
+   prompt — except the newest N messages (default 10), which always
+   stay raw. **Unwritten messages are never hidden**: hiding only ever
+   lands on memory-entry boundaries at or below the written frontier.
+
+Older memories fold into a per-character long-term memory (and world
+long-term memory) when they grow past a size threshold.
 
 ## UI
 
-- A draggable 🧠 button floats over the chat. Its ring shows how close
-  the history is to the apply threshold; the badge counts stockpiled
-  summaries. Tap it to open the summary sheet.
-- The sheet lists every summary like a table of contents — chapters as
-  headings, each entry badged ✅ IN PROMPT / 📦 STOCKPILED. Tap an entry
-  to read the original messages it covers, or edit the summary text.
-- The sheet header reports whether the last generation actually included
-  the memory block.
-- On phones, the 🧠 button is anchored from the top of the screen with
-  viewport units (v1.1.1+). SillyTavern sets a transform on `<html>` that
-  breaks bottom-anchored `position: fixed` elements on mobile layouts,
-  which previously pushed the button off-screen.
+The 🎭 floating button (draggable; badge = characters on stage, ring =
+unwritten tokens toward the next mid-scene write) opens a sheet with
+three tabs:
 
-## Settings
+- **Characters** — the roster; tap a character for their profile and
+  memories, rendered as markdown. Profiles are editable; presence can
+  be toggled by hand; every memory entry can show its original
+  messages or be deleted.
+- **World** — world setting (from world blocks, editable) and world
+  memory entries with the same original-text view.
+- **Ops** — close the scene and write memories now, un-apply (send all
+  originals again), add a character manually, wipe all data.
 
-Verbatim keep window, batch size, apply threshold, memory budget, and the
-summarizer connection (Main API / Connection Profile / OpenAI-compatible /
-Ollama) are in the extension settings drawer.
+The same sheet is reachable from the wand (extensions) menu.
 
-## Notes
+## Data & reversibility
 
-- Per-chat data lives in `chatMetadata['stockpile_memory']`; nothing is
-  written into message text. Disabling or removing the extension leaves
-  the chat untouched (the ignore flags are in-memory only and are
-  re-asserted from the stored state when the chat loads).
+Everything lives in `chatMetadata['cast_memory']` of each chat —
+profiles, memories, world records, the presence log, and the
+written/applied frontiers. The summary engine's data of the old
+Stockpile Memory (`chatMetadata['stockpile_memory']`) is not touched.
+Turning the extension off, or using "un-apply", restores the full raw
+history; nothing is ever deleted from the chat itself.
+
+## Settings highlights
+
+- Newest messages kept raw (default 10)
+- Mid-scene write threshold in tokens (default 6000)
+- Injected memory budget (default 3000 tokens)
+- Fold threshold per character / world (default 4000 chars)
+- Sub-model connection: profile (recommended — e.g. a flat-rate
+  model), OpenAI-compatible endpoint, Ollama, or the main API
+- Writer / fold prompts are fully editable
+
+## Lineage
+
+Forked in code from Extension-StockpileMemory v1.1.1 (same author):
+interceptor injection, ignore-flag hiding, the Popup-API sheet and the
+top-anchored FAB (ST's transformed `<html>` breaks bottom-anchored
+fixed elements on phones) are inherited from it. The storage,
+presence system, per-character memory writing and UI are new.
