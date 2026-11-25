@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -72,6 +72,7 @@ const defaultSettings = Object.freeze({
     enabled: true,
     keepTailMessages: 10,        // newest chat messages always kept raw
     sceneThresholdTokens: 6000,  // unwritten tokens that force a mid-scene write
+    sceneTurnLimit: 6,           // unwritten assistant turns that force a write
     memoryBudgetTokens: 3000,    // max tokens of injected memory sections
     foldCharThreshold: 4000,     // per-character memory chars before folding
     summarizerResponseLength: 3000,
@@ -688,7 +689,10 @@ async function maybeWriteScene(manual = false) {
     const nobodyPresent = presentNames(store).length === 0;
     const enoughTurns = assistantCountInRange(start, end) >= 2;
     const overThreshold = lastUnwrittenEstimate >= s.sceneThresholdTokens;
-    if (!manual && !((nobodyPresent && enoughTurns) || overThreshold)) return false;
+    // Continuous scenes with a stable cast may never see a logout; a turn
+    // limit guarantees memories still form at a steady cadence.
+    const turnLimitHit = s.sceneTurnLimit > 0 && assistantCountInRange(start, end) >= s.sceneTurnLimit;
+    if (!manual && !((nobodyPresent && enoughTurns) || overThreshold || turnLimitHit)) return false;
 
     isWorking = true;
     try {
@@ -1633,6 +1637,7 @@ function syncSettingsForm() {
     chk('cm_enabled', s.enabled);
     set('cm_tail', s.keepTailMessages);
     set('cm_threshold', s.sceneThresholdTokens);
+    set('cm_turns', s.sceneTurnLimit);
     set('cm_budget', s.memoryBudgetTokens);
     set('cm_fold', s.foldCharThreshold);
     set('cm_resp_len', s.summarizerResponseLength);
@@ -1668,6 +1673,7 @@ function bindSettings() {
     });
     num('cm_tail', 'keepTailMessages');
     num('cm_threshold', 'sceneThresholdTokens');
+    num('cm_turns', 'sceneTurnLimit');
     num('cm_budget', 'memoryBudgetTokens');
     num('cm_fold', 'foldCharThreshold');
     num('cm_resp_len', 'summarizerResponseLength');
@@ -1743,6 +1749,6 @@ if (typeof module !== 'undefined' && module.exports) {
         recomputePresence, parseWriterOutput, emptyStore, getCharacter,
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
-        getStore, getSettings, markAppliedMessages,
+        getStore, getSettings, markAppliedMessages, maybeWriteScene,
     };
 }

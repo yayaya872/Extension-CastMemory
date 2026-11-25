@@ -20,8 +20,8 @@ This repository is the merged edition built on Stockpile Memory
    [PROMPT_RULES.md](PROMPT_RULES.md) for the block you paste into your
    preset.
 2. **Memory writing (sub model).** When a scene closes (everyone
-   logged out), when unwritten history passes a token threshold, or on
-   a manual tap, a sub model of your choice (connection profile /
+   logged out), when unwritten history passes a token threshold or a
+   turn limit, or on a manual tap, a sub model of your choice (connection profile /
    OpenAI-compatible / Ollama / main API) reads the scene and writes:
    one subjective memory per participant, plus shared world-memory
    entries — as JSON, stored per character.

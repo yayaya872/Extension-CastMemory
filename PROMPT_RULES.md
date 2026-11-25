@@ -23,6 +23,12 @@ happens, in the same reply where it happens.
    somewhere they are not):
    <!-- castmemory: logout Character Name -->
 
+   A change of day, a time skip, or a move to a different place ENDS
+   the scene. In the first reply of the new scene, log out every
+   character who is not there, and log in every character who newly
+   appears. Characters who simply continue into the new scene need no
+   new block.
+
 3. The FIRST time a character is introduced, emit their profile block
    BEFORE their first lines. This also logs them in — no separate login
    block is needed for them in that reply:

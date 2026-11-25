@@ -43,6 +43,14 @@
             </div>
 
             <div class="cm-row">
+                <label for="cm_turns">
+                    <span>場面の途中締めターン数</span>
+                    <small class="cm-hint">同じキャストで場面が続いてログアウトが来ない場合でも、未書込のアシスタント返答がこの件数に達したら記憶に書き出します。0で無効。</small>
+                </label>
+                <input id="cm_turns" type="number" class="text_pole" min="0" step="1" />
+            </div>
+
+            <div class="cm-row">
                 <label for="cm_budget">
                     <span>注入する記憶の予算（トークン）</span>
                     <small class="cm-hint">プロンプトに入れる記憶セクション（ワールド記憶＋登場中キャラの記憶）の上限。名簿とワールド設定は常に全量入ります。</small>
