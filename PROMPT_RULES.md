@@ -34,9 +34,13 @@ happens, in the same reply where it happens.
    block is needed for them in that reply:
    <!-- castmemory character start
    Name: Character Name
-   (profile in markdown: age, appearance, personality, situation,
-   relationship to {{user}}, anything that defines them)
+   ...
    castmemory character end -->
+   The "..." is the profile itself: plain markdown prose (age,
+   appearance, personality, situation, relationship to {{user}},
+   anything that defines them), written directly as the block body.
+   Never wrap it in a label or parentheses — do NOT write anything
+   like "(profile in markdown: ...)" in the block.
 
    When a later scene reveals a lasting change to a character (new
    resolve, injury, changed relationship), emit the same block again
@@ -47,8 +51,10 @@ happens, in the same reply where it happens.
    time (a place's layout, an organization's rules, a recurring
    location), record it:
    <!-- castmemory world start
-   (world info in markdown)
+   ...
    castmemory world end -->
+   The "..." is the world info itself, written directly as plain
+   markdown prose — no labels or wrappers around it.
 
 Rules:
 - Use each character's exact registered name in login/logout blocks.

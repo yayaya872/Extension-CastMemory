@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.5';
+const VERSION = '2.0.6';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -237,6 +237,21 @@ const LOGOUT_RE = /<!--\s*castmemory:\s*logout\s+([^>]+?)\s*-->/gi;
 const CHAR_BLOCK_RE = /<!--\s*castmemory\s+character\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+character\s+end\s*-->/gi;
 const WORLD_BLOCK_RE = /<!--\s*castmemory\s+world\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+world\s+end\s*-->/gi;
 
+/**
+ * Strip a format-placeholder wrapper a model may echo around a
+ * profile / world body: "(profile in markdown: ...)" → "...". Pure.
+ */
+function unwrapBodyText(text) {
+    let t = String(text || '').trim();
+    const m = t.match(/^\(\s*(?:profile|world info)\s+in\s+markdown\s*:?\s*/i);
+    if (m) {
+        t = t.slice(m[0].length);
+        if (t.endsWith(')')) t = t.slice(0, -1);
+        t = t.trim();
+    }
+    return t;
+}
+
 /** Extract every castmemory block from a message text. Pure. */
 function parseBlocks(text) {
     const found = [];
@@ -255,9 +270,9 @@ function parseBlocks(text) {
         const nameLine = body.split('\n').map(x => x.trim()).find(x => /^name\s*:/i.test(x));
         const name = nameLine ? nameLine.replace(/^name\s*:\s*/i, '').trim() : '';
         const profile = body.split('\n').filter(x => x !== nameLine).join('\n').trim();
-        return { kind: 'character', name, profile: profile || body };
+        return { kind: 'character', name, profile: unwrapBodyText(profile || body) };
     });
-    collect(WORLD_BLOCK_RE, (mm) => ({ kind: 'world', text: mm[1].trim() }));
+    collect(WORLD_BLOCK_RE, (mm) => ({ kind: 'world', text: unwrapBodyText(mm[1]) }));
     found.sort((a, b) => a.at - b.at);
     return found;
 }
@@ -1942,7 +1957,7 @@ if (typeof module !== 'undefined' && module.exports) {
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
         matchCharacterName, normalizeName, extractJsonCandidates, repairJsonStrings,
-        rewindLastWrite,
+        rewindLastWrite, unwrapBodyText,
         getStore, getSettings, markAppliedMessages, maybeWriteScene,
         getLastInjected: () => lastInjected,
     };
