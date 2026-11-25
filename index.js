@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.4';
+const VERSION = '2.0.5';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -164,6 +164,7 @@ function emptyStore() {
         parsedUpTo: -1,
         writtenUpTo: -1,
         appliedUpTo: -1,
+        lastWrite: null,
     };
 }
 
@@ -178,6 +179,7 @@ function getStore() {
     if (!store.characters || typeof store.characters !== 'object') store.characters = {};
     if (typeof store.worldSetting !== 'string') store.worldSetting = '';
     if (!Array.isArray(store.worldEntries)) store.worldEntries = [];
+    if (store.lastWrite === undefined) store.lastWrite = null;
     if (typeof store.worldLongTerm !== 'string') store.worldLongTerm = '';
     if (!Array.isArray(store.presence)) store.presence = [];
     for (const k of ['parsedUpTo', 'writtenUpTo', 'appliedUpTo']) {
@@ -579,26 +581,77 @@ async function callSubModel(systemPrompt, userPrompt) {
  * Extract the memory-writing JSON from a sub-model reply.
  * Returns { world: string, memories: {name: string} } or null. Pure.
  */
+/** All top-level balanced {...} spans in a text (string-aware). Pure. */
+function extractJsonCandidates(t) {
+    const spans = [];
+    let depth = 0, start = -1, inStr = false, esc = false;
+    for (let i = 0; i < t.length; i++) {
+        const c = t[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c === '\\') esc = true;
+            else if (c === '"') inStr = false;
+            continue;
+        }
+        if (c === '"') { inStr = true; continue; }
+        if (c === '{') { if (depth === 0) start = i; depth++; }
+        else if (c === '}') {
+            depth--;
+            if (depth === 0 && start >= 0) { spans.push(t.slice(start, i + 1)); start = -1; }
+            if (depth < 0) depth = 0;
+        }
+    }
+    return spans;
+}
+
+/** Escape raw control characters sitting inside JSON string literals. Pure. */
+function repairJsonStrings(t) {
+    let out = '', inStr = false, esc = false;
+    for (const c of t) {
+        if (inStr) {
+            if (esc) { out += c; esc = false; continue; }
+            if (c === '\\') { out += c; esc = true; continue; }
+            if (c === '"') { out += c; inStr = false; continue; }
+            if (c === '\n') { out += '\\n'; continue; }
+            if (c === '\r') { out += '\\r'; continue; }
+            if (c === '\t') { out += '\\t'; continue; }
+            out += c; continue;
+        }
+        if (c === '"') inStr = true;
+        out += c;
+    }
+    return out;
+}
+
+/**
+ * Parse the writer's JSON. Real responses may wrap the payload in
+ * reasoning prose that itself contains braces, or carry literal
+ * newlines inside string values — try every complete object,
+ * last first, with and without string repair.
+ * Returns { world, memories } or null.
+ */
 function parseWriterOutput(raw) {
     if (!raw) return null;
-    let t = cleanModelText(raw).replace(/```(?:json)?/gi, '');
-    const start = t.indexOf('{');
-    const end = t.lastIndexOf('}');
-    if (start < 0 || end <= start) return null;
-    try {
-        const obj = JSON.parse(t.slice(start, end + 1));
-        const world = typeof obj.world === 'string' ? obj.world.trim() : '';
-        const memories = {};
-        if (obj.memories && typeof obj.memories === 'object') {
-            for (const [k, v] of Object.entries(obj.memories)) {
-                if (typeof v === 'string' && v.trim()) memories[k] = v.trim();
-            }
+    const t = cleanModelText(raw).replace(/```(?:json)?/gi, '');
+    const candidates = extractJsonCandidates(t);
+    for (let i = candidates.length - 1; i >= 0; i--) {
+        for (const variant of [candidates[i], repairJsonStrings(candidates[i])]) {
+            try {
+                const obj = JSON.parse(variant);
+                if (!obj || typeof obj !== 'object') continue;
+                const world = typeof obj.world === 'string' ? obj.world.trim() : '';
+                const memories = {};
+                if (obj.memories && typeof obj.memories === 'object') {
+                    for (const [k, v] of Object.entries(obj.memories)) {
+                        if (typeof v === 'string' && v.trim()) memories[k] = v.trim();
+                    }
+                }
+                if (!world && Object.keys(memories).length === 0) continue;
+                return { world, memories };
+            } catch { /* try the next candidate / variant */ }
         }
-        if (!world && Object.keys(memories).length === 0) return null;
-        return { world, memories };
-    } catch (e) {
-        return null;
     }
+    return null;
 }
 
 // ─── Passage building ────────────────────────────────────────────────────────
@@ -723,9 +776,37 @@ async function writeMemoriesForRange(start, end) {
     }
 
     store.writtenUpTo = end;
+    store.lastWrite = { start, end };
     saveStore();
     log(`Wrote memories for [${start}–${end}] participants=[${participants.join(', ')}]`);
     return true;
+}
+
+/**
+ * Undo the most recent memory write: drop the entries it produced,
+ * rewind writtenUpTo, un-hide anything past the new frontier, then
+ * re-run the write. Used to recover from a degraded write (e.g. the
+ * sub model's JSON failed to parse and landed in world memory raw).
+ * Entries already folded into long-term memory are not restored.
+ */
+async function rewindLastWrite() {
+    const store = getStore();
+    if (!store || !store.lastWrite) return false;
+    const { start } = store.lastWrite;
+    store.worldEntries = store.worldEntries.filter(e => e.start !== start);
+    for (const ch of Object.values(store.characters)) {
+        ch.memories = ch.memories.filter(m => m.start !== start);
+    }
+    store.writtenUpTo = start - 1;
+    if (store.appliedUpTo > store.writtenUpTo) {
+        store.appliedUpTo = store.writtenUpTo;
+        unmarkAllMessages();
+        markAppliedMessages();
+    }
+    store.lastWrite = null;
+    saveStore();
+    log(`Rewound last write (range started at ${start}); rewriting`);
+    return await maybeWriteScene(true);
 }
 
 /**
@@ -1253,6 +1334,7 @@ function buildSheetContent() {
         <div class="cm-view cm-view-ops" hidden>
             <div class="cm-ops-btns">
                 <button class="cm-btn" type="button" data-act="scene-close">🎬 場面を締めて記憶を書く</button>
+                <button class="cm-btn" type="button" data-act="rewind">🔁 最後の書き込みを取り消して書き直す</button>
                 <button class="cm-btn" type="button" data-act="unapply">↩️ 反映を解除（原文を全部戻す）</button>
                 <button class="cm-btn cm-btn-danger" type="button" data-act="clear">🗑 全データを消去</button>
             </div>
@@ -1630,6 +1712,19 @@ async function onSheetClick(e) {
             renderSheet();
             break;
         }
+        case 'rewind': {
+            if (isWorking) { toastr.info('作業中です…', 'Cast Memory'); break; }
+            const st = getStore();
+            if (!st?.lastWrite) { toastr.info('取り消せる書き込みがありません', 'Cast Memory'); break; }
+            if (!confirm('最後の書き込み（キャラ記憶・ワールド記憶）を取り消して、同じ範囲を書き直しますか？')) break;
+            toastr.info('最後の書き込みを書き直しています…', 'Cast Memory');
+            const ok = await rewindLastWrite();
+            if (ok) toastr.success('書き直しました', 'Cast Memory');
+            else if (lastWriterError) toastr.error(`書き直しエラー: ${lastWriterError}`, 'Cast Memory');
+            else toastr.info('書き直せませんでした', 'Cast Memory');
+            renderSheet();
+            break;
+        }
         case 'unapply': {
             unapplyAll();
             try { await SillyTavern.getContext().saveChat(); } catch (err) { /* noop */ }
@@ -1846,7 +1941,8 @@ if (typeof module !== 'undefined' && module.exports) {
         recomputePresence, parseWriterOutput, emptyStore, getCharacter,
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
-        matchCharacterName, normalizeName,
+        matchCharacterName, normalizeName, extractJsonCandidates, repairJsonStrings,
+        rewindLastWrite,
         getStore, getSettings, markAppliedMessages, maybeWriteScene,
         getLastInjected: () => lastInjected,
     };
