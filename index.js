@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.1';
+const VERSION = '2.0.2';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -367,9 +367,28 @@ function ignoreSymbol() {
     return SillyTavern.getContext().symbols.ignore;
 }
 
+/**
+ * Token counting with a session-level circuit breaker. ST's counter can
+ * fail for some custom endpoints (it shows "An unknown error occurred
+ * while counting tokens"); when it does, fall back to a length estimate
+ * and never call it again this session, so the failure can't repeat.
+ */
+let tokenCounterBroken = false;
+async function countTokens(text) {
+    if (!text) return 0;
+    if (tokenCounterBroken) return Math.ceil(text.length / 2);
+    try {
+        return await SillyTavern.getContext().getTokenCountAsync(text, 0);
+    } catch (e) {
+        tokenCounterBroken = true;
+        warn('token counter failed; using length-based estimates for this session:', e);
+        return Math.ceil(text.length / 2);
+    }
+}
+
 async function estimateChatTokens() {
     try {
-        const { chat, getTokenCountAsync } = SillyTavern.getContext();
+        const { chat } = SillyTavern.getContext();
         const IGNORE = ignoreSymbol();
         let total = 0;
         for (let i = 0; i < chat.length; i++) {
@@ -379,9 +398,7 @@ async function estimateChatTokens() {
             if (msg.extra?.[IGNORE]) continue;
             const cached = _tokenCache.get(i);
             if (cached && cached.mes === msg.mes) { total += cached.tokens; continue; }
-            let tokens;
-            try { tokens = await getTokenCountAsync(msg.mes, 0); }
-            catch (e) { tokens = Math.ceil(msg.mes.length / 2); }
+            const tokens = await countTokens(msg.mes);
             _tokenCache.set(i, { mes: msg.mes, tokens });
             total += tokens;
         }
@@ -396,25 +413,21 @@ const _textTokenCache = new Map();
 async function estimateTextTokens(text) {
     if (!text) return 0;
     if (_textTokenCache.has(text)) return _textTokenCache.get(text);
-    let tokens;
-    try { tokens = await SillyTavern.getContext().getTokenCountAsync(text, 0); }
-    catch (e) { tokens = Math.ceil(text.length / 2); }
+    const tokens = await countTokens(text);
     _textTokenCache.set(text, tokens);
     return tokens;
 }
 
 /** Tokens of chat messages in (fromExclusive, toInclusive] not yet ignored. */
 async function estimateRangeTokens(fromExclusive, toInclusive) {
-    const { chat, getTokenCountAsync } = SillyTavern.getContext();
+    const { chat } = SillyTavern.getContext();
     let total = 0;
     for (let i = fromExclusive + 1; i <= toInclusive && i < chat.length; i++) {
         const msg = chat[i];
         if (!msg || !msg.mes || msg.is_system) continue;
         const cached = _tokenCache.get(i);
         if (cached && cached.mes === msg.mes) { total += cached.tokens; continue; }
-        let tokens;
-        try { tokens = await getTokenCountAsync(msg.mes, 0); }
-        catch (e) { tokens = Math.ceil(msg.mes.length / 2); }
+        const tokens = await countTokens(msg.mes);
         _tokenCache.set(i, { mes: msg.mes, tokens });
         total += tokens;
     }
