@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.2';
+const VERSION = '2.0.3';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -983,6 +983,7 @@ async function assembleBlock(store, budgetTokens) {
 }
 
 let lastGen = { at: 0, included: false, type: '' };
+let lastInjected = { at: 0, text: '' };
 
 globalThis.castMemoryInterceptor = async function (chatArray, _contextSize, _abort, type) {
     try {
@@ -994,6 +995,7 @@ globalThis.castMemoryInterceptor = async function (chatArray, _contextSize, _abo
         if (!store) return;
         const block = await assembleBlock(store, s.memoryBudgetTokens + 800); // +800: roster/setting headroom
         if (!block) return;
+        lastInjected = { at: Date.now(), text: block };
         chatArray.splice(0, 0, {
             name: 'Cast Memory',
             is_user: false,
@@ -1217,6 +1219,13 @@ function buildSheetContent() {
                 <button class="cm-btn" type="button" data-act="char-add">追加</button>
             </div>
             <div class="cm-ops-note">記憶の書き込みは「全員ログアウトした場面の終わり」か、未書込分が設定トークンを超えた時に自動でも行われます。書けていないメッセージは絶対に隠れません。</div>
+            <div class="cm-section-title">注入の確認</div>
+            <div class="cm-ops-btns">
+                <button class="cm-btn" type="button" data-act="inj-last">📤 前回生成で実際に送った注入を見る</button>
+                <button class="cm-btn" type="button" data-act="inj-preview">🔍 現在の状態で組み立てた注入を見る</button>
+            </div>
+            <div class="cm-inj-meta"></div>
+            <div class="cm-inj-view" hidden></div>
         </div>`;
     el.addEventListener('click', onSheetClick);
     cmSheetEl = el;
@@ -1537,8 +1546,39 @@ async function onSheetClick(e) {
             renderSheet();
             break;
         }
-        case 'scene-close': {
-            if (isWorking) { toastr.info('作業中です…', 'Cast Memory'); break; }
+        case 'inj-last': {
+            const view = cmSheetEl.querySelector('.cm-inj-view');
+            const meta = cmSheetEl.querySelector('.cm-inj-meta');
+            if (!view) break;
+            if (!lastInjected.text) {
+                meta.textContent = 'まだ注入の記録がありません（このセッションで生成すると記録されます）';
+                view.hidden = true;
+                break;
+            }
+            const tokens = await estimateTextTokens(lastInjected.text);
+            meta.textContent = `前回生成 ${formatDate(lastInjected.at)} の注入 — 約 ${tokens} tok / ${lastInjected.text.length} 字`;
+            view.textContent = lastInjected.text;
+            view.hidden = false;
+            break;
+        }
+        case 'inj-preview': {
+            const view = cmSheetEl.querySelector('.cm-inj-view');
+            const meta = cmSheetEl.querySelector('.cm-inj-meta');
+            if (!view) break;
+            const s = getSettings();
+            const text = await assembleBlock(store, s.memoryBudgetTokens + 800);
+            if (!text) {
+                meta.textContent = '現在の状態では注入される内容がありません';
+                view.hidden = true;
+                break;
+            }
+            const tokens = await estimateTextTokens(text);
+            meta.textContent = `現在の状態での注入プレビュー — 約 ${tokens} tok / ${text.length} 字`;
+            view.textContent = text;
+            view.hidden = false;
+            break;
+        }
+        case 'scene-close': {            if (isWorking) { toastr.info('作業中です…', 'Cast Memory'); break; }
             toastr.info('場面を締めて記憶を書いています…', 'Cast Memory');
             const ok = await maybeWriteScene(true);
             if (ok) toastr.success('記憶を書き込みました', 'Cast Memory');
@@ -1763,5 +1803,6 @@ if (typeof module !== 'undefined' && module.exports) {
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
         getStore, getSettings, markAppliedMessages, maybeWriteScene,
+        getLastInjected: () => lastInjected,
     };
 }
