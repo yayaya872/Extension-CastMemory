@@ -1,9 +1,9 @@
-# Cast Memory 設計案（ドラフト・未承認）
+# Cast Memory 設計案
 
-2026-11-25、たくみとの会話で決まった分担を設計に落としたもの。**実装はまだしない。** この案へのOKが出てから作る。現行 Stockpile Memory v1.1.1 は別リポジトリで凍結したまま、一切触らない。
+2026-11-25、たくみとの会話で決まった分担を設計に落としたもの。**同日、たくみの承認でこの設計のまま v2.0.0 として実装・公開済み。** 現行 Stockpile Memory v1.1.1 は別リポジトリで凍結したまま、一切触らない。
 
 リポジトリ：https://github.com/yayaya872/Extension-CastMemory
-作業コピー：`~/workspace/cast-memory`（現状は v1.1.1 のコピー＋改名のみ）
+作業コピー：`~/workspace/cast-memory`
 
 ## やりたいこと
 
