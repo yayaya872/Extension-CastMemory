@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.3';
+const VERSION = '2.0.4';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -103,7 +103,7 @@ Write the memory records for this scene as JSON with exactly this shape:
 
 Rules:
 - "world": objective, shared facts only — what happened, where, when; decisions and promises anyone present could know; changes to places, items or ongoing situations; unresolved threads. Short markdown lines, no dialogue quotes. If nothing world-level changed, use "".
-- "memories": one entry per participant listed above, keyed by their exact name. Write what THAT character personally experienced: what they saw, heard, were told, felt, decided, misunderstood, or are now suspicious / hopeful / afraid about. Subjective, first-person viewpoint ("I ...") in brief markdown lines. A character can only remember things they were present for — never give them knowledge from outside this scene. If a participant was present but nothing notable happened to them, use "".
+- "memories": one entry per participant listed above, keyed by their name copied character-for-character from the participants list — do not add readings, spaces, honorifics or surnames that are not in the listed name. Write what THAT character personally experienced: what they saw, heard, were told, felt, decided, misunderstood, or are now suspicious / hopeful / afraid about. Subjective, first-person viewpoint ("I ...") in brief markdown lines. A character can only remember things they were present for — never give them knowledge from outside this scene. If a participant was present but nothing notable happened to them, use "".
 - Keep every entry tight: only what would change how that character acts later. No atmosphere, no prose retelling.`,
     foldSystemPrompt:
         'You condense long-term memory records. Output only the condensed memory text — no preamble, no commentary.',
@@ -347,6 +347,40 @@ function participantsForRange(store, start, end) {
     return names;
 }
 
+/**
+ * Resolve a sub-model memory key to a registered character name.
+ * Sub models embellish names (added readings, spaces, full vs short
+ * forms), so match in stages: exact → normalized exact → containment.
+ * Pure.
+ */
+function normalizeName(s) {
+    return String(s || '')
+        .replace(/[（(][^）)]*[）)]/g, '')
+        .replace(/\s+/g, '')
+        .trim();
+}
+
+function matchCharacterName(store, key) {
+    if (!key || !store || !store.characters) return null;
+    if (store.characters[key]) return key;
+    const nk = normalizeName(key);
+    if (!nk) return null;
+    const names = characterNames(store);
+    for (const n of names) {
+        if (normalizeName(n) === nk) return n;
+    }
+    const contains = names.filter(n => {
+        const nn = normalizeName(n);
+        return nn && (nk.includes(nn) || nn.includes(nk));
+    });
+    if (contains.length === 1) return contains[0];
+    if (contains.length > 1) {
+        contains.sort((a, b) => normalizeName(b).length - normalizeName(a).length);
+        return contains[0];
+    }
+    return null;
+}
+
 /** Recompute present flags from the presence log (after edits/deletes). */
 function recomputePresence(store) {
     for (const name of characterNames(store)) store.characters[name].present = false;
@@ -437,6 +471,7 @@ async function estimateRangeTokens(fromExclusive, toInclusive) {
 // ─── Sub-model calls ─────────────────────────────────────────────────────────
 
 let lastWriterError = '';
+let lastDroppedNote = '';
 
 function extractText(res) {
     if (!res) return '';
@@ -661,11 +696,19 @@ async function writeMemoriesForRange(start, end) {
         if (parsed.world) {
             store.worldEntries.push({ id: newId(), text: parsed.world, start, end, ts });
         }
+        const dropped = [];
         for (const [name, text] of Object.entries(parsed.memories)) {
-            const ch = store.characters[name];
-            if (!ch) continue; // never invent characters from sub-model output
+            const matched = matchCharacterName(store, name);
+            if (!matched) { dropped.push(name); continue; } // never invent characters
+            const ch = store.characters[matched];
             ch.memories.push({ id: newId(), text, start, end, ts });
             ch.updated = ts;
+        }
+        if (dropped.length) {
+            lastDroppedNote = `名前が一致せず割り当てられなかった記憶: ${dropped.join(', ')}`;
+            warn(lastDroppedNote);
+        } else {
+            lastDroppedNote = '';
         }
         // Participants the sub model skipped still need coverage proof:
         // the range counts as written (world entry or not) — the write
@@ -1616,7 +1659,8 @@ function statusText() {
     const gen = !lastGen.at ? '前回生成: —' : (lastGen.included ? '前回生成: 記録あり ✓' : '前回生成: 記録なし');
     const work = isWorking ? ' · 記憶を作成中…' : '';
     const err = lastWriterError ? ` · ⚠️ ${lastWriterError}` : '';
-    return `${tok}${unwritten ? ` ／ ${unwritten}` : ''} ／ キャラ ${names.length}（登場中 ${present}） ／ 書込済 msg ${store.writtenUpTo}・反映済 msg ${store.appliedUpTo} ／ ${gen}${work}${err}`;
+    const drop = lastDroppedNote ? ` · ⚠️ ${lastDroppedNote}` : '';
+    return `${tok}${unwritten ? ` ／ ${unwritten}` : ''} ／ キャラ ${names.length}（登場中 ${present}） ／ 書込済 msg ${store.writtenUpTo}・反映済 msg ${store.appliedUpTo} ／ ${gen}${work}${err}${drop}`;
 }
 
 function updateFab() {
@@ -1802,6 +1846,7 @@ if (typeof module !== 'undefined' && module.exports) {
         recomputePresence, parseWriterOutput, emptyStore, getCharacter,
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
+        matchCharacterName, normalizeName,
         getStore, getSettings, markAppliedMessages, maybeWriteScene,
         getLastInjected: () => lastInjected,
     };
