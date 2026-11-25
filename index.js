@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.6';
+const VERSION = '2.0.7';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -234,6 +234,7 @@ function presentNames(store) {
 
 const LOGIN_RE = /<!--\s*castmemory:\s*login\s+([^>]+?)\s*-->/gi;
 const LOGOUT_RE = /<!--\s*castmemory:\s*logout\s+([^>]+?)\s*-->/gi;
+const RENAME_RE = /<!--\s*castmemory:\s*rename\s+(.+?)\s*(?:->|→|=>)\s*(.+?)\s*-->/gi;
 const CHAR_BLOCK_RE = /<!--\s*castmemory\s+character\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+character\s+end\s*-->/gi;
 const WORLD_BLOCK_RE = /<!--\s*castmemory\s+world\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+world\s+end\s*-->/gi;
 
@@ -265,6 +266,7 @@ function parseBlocks(text) {
     };
     collect(LOGIN_RE, (mm) => ({ kind: 'login', name: mm[1].trim() }));
     collect(LOGOUT_RE, (mm) => ({ kind: 'logout', name: mm[1].trim() }));
+    collect(RENAME_RE, (mm) => ({ kind: 'rename', name: mm[1].trim(), newName: mm[2].trim() }));
     collect(CHAR_BLOCK_RE, (mm) => {
         const body = mm[1].trim();
         const nameLine = body.split('\n').map(x => x.trim()).find(x => /^name\s*:/i.test(x));
@@ -283,6 +285,7 @@ function stripBlocks(text) {
     return text
         .replace(LOGIN_RE, '')
         .replace(LOGOUT_RE, '')
+        .replace(RENAME_RE, '')
         .replace(CHAR_BLOCK_RE, '')
         .replace(WORLD_BLOCK_RE, '')
         .replace(/\n{3,}/g, '\n\n')
@@ -293,6 +296,34 @@ function stripBlocks(text) {
  * Apply one parsed block to the store at chat position `index`.
  * Returns true when the store changed.
  */
+/**
+ * Rename a character, carrying over profile, memories, long-term
+ * memory and presence history. If the new name is already registered,
+ * the two records merge (memories combined in story order).
+ * Pure store operation.
+ */
+function renameCharacter(store, oldName, newName) {
+    if (!store || !oldName || !newName || oldName === newName) return false;
+    const src = store.characters[oldName];
+    if (!src) return false;
+    const dst = store.characters[newName];
+    if (dst) {
+        dst.memories = [...dst.memories, ...src.memories].sort((a, b) => (a.start - b.start) || (a.ts - b.ts));
+        dst.longTerm = [dst.longTerm, src.longTerm].filter(Boolean).join('\n');
+        if (!dst.profile) dst.profile = src.profile;
+        dst.present = dst.present || src.present;
+        dst.created = Math.min(dst.created || Infinity, src.created || Infinity);
+        dst.updated = Date.now();
+    } else {
+        store.characters[newName] = src;
+    }
+    delete store.characters[oldName];
+    for (const p of store.presence) {
+        if (p.name === oldName) p.name = newName;
+    }
+    return true;
+}
+
 function applyBlock(store, block, index) {
     if (!block || !block.kind) return false;
     switch (block.kind) {
@@ -327,6 +358,10 @@ function applyBlock(store, block, index) {
                 store.presence.push({ index, name: block.name, action: 'login' });
             }
             return true;
+        }
+        case 'rename': {
+            if (!block.name || !block.newName) return false;
+            return renameCharacter(store, block.name, block.newName);
         }
         case 'world': {
             if (!block.text) return false;
@@ -1472,6 +1507,7 @@ function renderCastView() {
             </div>
             <div class="cm-detail-btns">
                 <button class="cm-btn cm-btn-small" type="button" data-act="presence-toggle" data-name="${encName(name)}">${ch.present ? 'ログアウトさせる' : 'ログインさせる'}</button>
+                <button class="cm-btn cm-btn-small" type="button" data-act="char-rename" data-name="${encName(name)}">名前を変更</button>
                 <button class="cm-btn cm-btn-small cm-btn-danger" type="button" data-act="char-del" data-name="${encName(name)}">キャラを削除</button>
             </div>
             <div class="cm-section-title">プロフィール</div>
@@ -1591,6 +1627,17 @@ async function onSheetClick(e) {
             saveStore();
             renderSheet();
             updateFab();
+            break;
+        }
+        case 'char-rename': {
+            const name = decName(btn.dataset.name);
+            const newName = (prompt(`「${name}」の新しい名前（判明した本名など）`, name) || '').trim();
+            if (!newName || newName === name) break;
+            if (!renameCharacter(store, name, newName)) { toastr.error('名前を変更できませんでした', 'Cast Memory'); break; }
+            if (cmSelectedChar === name) cmSelectedChar = newName;
+            saveStore();
+            renderSheet();
+            toastr.success(`「${name}」→「${newName}」に変更しました`, 'Cast Memory');
             break;
         }
         case 'char-del': {
@@ -1957,7 +2004,7 @@ if (typeof module !== 'undefined' && module.exports) {
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
         matchCharacterName, normalizeName, extractJsonCandidates, repairJsonStrings,
-        rewindLastWrite, unwrapBodyText,
+        rewindLastWrite, unwrapBodyText, renameCharacter,
         getStore, getSettings, markAppliedMessages, maybeWriteScene,
         getLastInjected: () => lastInjected,
     };

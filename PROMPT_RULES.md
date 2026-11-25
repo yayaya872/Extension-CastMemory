@@ -56,6 +56,15 @@ happens, in the same reply where it happens.
    The "..." is the world info itself, written directly as plain
    markdown prose — no labels or wrappers around it.
 
+5. A character's REAL NAME is revealed after they were registered
+   under a descriptive placeholder (e.g. 赤髪の戦士, 白いローブの
+   魔道士): emit a rename block in the same reply where the name is
+   revealed:
+   <!-- castmemory: rename Old Name -> New Name -->
+   Their profile, memories and stage state move to the real name.
+   From then on, use the new name in every block. Rename only on a
+   genuine name reveal — nicknames, titles and aliases do not count.
+
 Rules:
 - Use each character's exact registered name in login/logout blocks.
   The injected <cast_memory> roster lists every registered name and
