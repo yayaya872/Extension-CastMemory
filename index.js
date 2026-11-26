@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -1465,25 +1465,23 @@ function buildFabAndSheet() {
     // the containing block for fixed elements; on the phone layout that
     // block collapses and bottom-anchored elements render above the
     // screen. Default spot is the top-left of the chat area.
-    el.style.cssText = 'position:fixed;left:10px;top:54px;width:min(78vw,340px);'
-        + 'z-index:2147483000;display:flex;flex-direction:column;gap:6px;'
+    el.style.cssText = 'position:fixed;left:10px;top:54px;width:min(46vw,190px);'
+        + 'z-index:2147483000;display:block;'
         + 'touch-action:none;user-select:none;-webkit-user-select:none;';
     el.innerHTML = `
-        <div class="cm-pill" id="cm-pill-loc">
-            <div class="cm-pill-head" data-pill="loc">
-                <span class="cm-pill-ico">📍</span>
+        <div class="cm-card">
+            <div class="cm-row" data-pill="loc">
+                <span class="cm-pin">📍</span>
                 <span class="cm-loc-name">現在地未設定</span>
-                <span class="cm-pill-chev">▾</span>
+                <span class="cm-chev">▾</span>
             </div>
-            <div class="cm-pill-body" hidden>
+            <div class="cm-loc-body" hidden>
                 <div class="cm-loc-detail cm-md mes_text"></div>
                 <button class="cm-btn cm-btn-small cm-loc-open-sheet" type="button">シートで開く（編集・削除）</button>
             </div>
-        </div>
-        <div class="cm-pill" id="cm-pill-tok">
-            <div class="cm-pill-head" data-pill="tok">
-                <span class="cm-pill-ico">🧮</span>
-                <span class="cm-tok-text">合計 ≈ ? tok</span>
+            <div class="cm-row cm-row-tok" data-pill="tok">
+                <span class="cm-tok-label">合計</span>
+                <span class="cm-tok-text">≈ ? tok</span>
                 <span class="cm-tok-sub"></span>
             </div>
             <div class="cm-tok-bar"><div class="cm-tok-bar-fg"></div></div>
@@ -1527,7 +1525,7 @@ function applyFloatPosition() {
 function bindFloatDrag(el) {
     let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false, moved = false, captured = false;
     el.addEventListener('pointerdown', (e) => {
-        if (e.target.closest('.cm-pill-body')) return; // let body content (scroll, button) behave
+        if (e.target.closest('.cm-loc-body')) return; // let body content (scroll, button) behave
         const rect = el.getBoundingClientRect();
         startX = e.clientX; startY = e.clientY;
         origLeft = rect.left; origTop = rect.top;
@@ -1594,11 +1592,14 @@ function buildWandMenuEntry() {
 function openCmSettings() {
     try {
         const block = document.querySelector('.cm-settings');
-        if (block) {
-            const drawer = document.getElementById('extensions-settings-button');
-            const content = document.getElementById('extensions_settings2');
-            const isOpen = content && content.offsetParent !== null;
-            if (!isOpen && drawer) drawer.click();
+        const drawer = document.getElementById('extensions-settings-button');
+        // ST binds the drawer open/close handler on the .drawer-toggle
+        // child — clicking the .drawer container itself does nothing.
+        const toggle = drawer ? drawer.querySelector('.drawer-toggle') : null;
+        if (block && toggle) {
+            const content = document.getElementById('rm_extensions_block');
+            const isOpen = content && !content.classList.contains('closedDrawer');
+            if (!isOpen) toggle.click();
             setTimeout(() => {
                 try { block.scrollIntoView({ block: 'start', behavior: 'smooth' }); } catch (e) { /* noop */ }
             }, 350);
@@ -2225,9 +2226,9 @@ function updateFloat() {
     const locName = el.querySelector('.cm-loc-name');
     const cur = store?.currentLocation || '';
     if (locName) locName.textContent = cur || '現在地未設定';
-    const chev = el.querySelector('.cm-pill-chev');
+    const chev = el.querySelector('.cm-chev');
     if (chev) chev.textContent = cmLocExpanded ? '▴' : '▾';
-    const body = el.querySelector('.cm-pill-body');
+    const body = el.querySelector('.cm-loc-body');
     if (body) {
         body.hidden = !cmLocExpanded;
         if (cmLocExpanded) {
