@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.2.1';
+const VERSION = '2.2.2';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -1479,12 +1479,6 @@ function buildFabAndSheet() {
                 <div class="cm-loc-detail cm-md mes_text"></div>
                 <button class="cm-btn cm-btn-small cm-loc-open-sheet" type="button">シートで開く（編集・削除）</button>
             </div>
-            <div class="cm-row cm-row-tok" data-pill="tok">
-                <span class="cm-tok-label">合計</span>
-                <span class="cm-tok-text">≈ ? tok</span>
-                <span class="cm-tok-sub"></span>
-            </div>
-            <div class="cm-tok-bar"><div class="cm-tok-bar-fg"></div></div>
         </div>`;
     document.body.appendChild(el);
     applyFloatPosition();
@@ -1565,8 +1559,6 @@ function bindFloatDrag(el) {
         if (head.dataset.pill === 'loc') {
             cmLocExpanded = !cmLocExpanded;
             updateFloat();
-        } else if (head.dataset.pill === 'tok') {
-            openSheet('ops');
         }
     });
 }
@@ -2242,29 +2234,6 @@ function updateFloat() {
         }
     }
 
-    // Token pill: total + unwritten progress bar (replaces the FAB ring).
-    const tokText = el.querySelector('.cm-tok-text');
-    if (tokText) {
-        if (lastTokenEstimate >= 0 && lastInjectedTokens >= 0) {
-            tokText.textContent = `合計 ≈ ${lastTokenEstimate + lastInjectedTokens} tok`;
-        } else if (lastTokenEstimate >= 0) {
-            tokText.textContent = `履歴 ≈ ${lastTokenEstimate} tok`;
-        } else {
-            tokText.textContent = '合計 ≈ ? tok';
-        }
-    }
-    const tokSub = el.querySelector('.cm-tok-sub');
-    if (tokSub) {
-        const n = store ? presentNames(store).length : 0;
-        tokSub.textContent = n > 0 ? `登場中 ${n}` : '';
-    }
-    const bar = el.querySelector('.cm-tok-bar-fg');
-    if (bar) {
-        const frac = (s.sceneThresholdTokens > 0 && lastUnwrittenEstimate >= 0)
-            ? Math.min(1, lastUnwrittenEstimate / s.sceneThresholdTokens) : 0;
-        bar.style.width = `${Math.round(frac * 100)}%`;
-        bar.style.background = frac >= 1 ? '#e06c5f' : (frac >= 0.7 ? '#e0a458' : '#7bc47f');
-    }
     el.style.opacity = s.enabled ? '1' : '0.45';
 }
 

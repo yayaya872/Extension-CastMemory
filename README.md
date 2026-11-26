@@ -42,10 +42,9 @@ long-term memory) when they grow past a size threshold.
 
 ## UI
 
-Two floating pills (draggable, top-left by default) sit over the chat:
-a 📍 current-location pill — tap it and the place's detail expands in
-place — and a token pill showing the send total with an unwritten-
-progress bar; tapping it opens the sheet. The sheet has three tabs:
+A floating 📍 current-location card (draggable, top-left by default)
+sits over the chat — tap it and the place's detail expands in place.
+The sheet has three tabs:
 
 - **Characters** — the roster; tap a character for their profile and
   memories, rendered as markdown. Profiles are editable; presence can
