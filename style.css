@@ -155,6 +155,33 @@
 .cm-addchar-title { font-weight: 700; font-size: 13px; margin-bottom: 8px; }
 .cm-addchar-name { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
 .cm-ops-note { font-size: 12px; opacity: 0.75; line-height: 1.5; }
+
+/* Quick-access buttons in ST's send form (#leftSendForm) */
+#cm-sendbtns {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 2px;
+}
+.cm-sendbtn {
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 4px 5px;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    color: inherit;
+}
+.cm-sendbtn:hover { background: rgba(127, 127, 127, 0.18); }
+
+/* Ghosted (memory-covered) messages in the chat UI */
+.mes.cm-ghost .mes_text { opacity: 0.45; }
+.mes.cm-ghost .mes_avatar { opacity: 0.45; }
+.mes.cm-ghost .name_text::after {
+    content: ' 👻';
+    font-size: 0.85em;
+}
 .cm-inj-meta { font-size: 12px; opacity: 0.85; margin: 6px 0; }
 .cm-inj-view {
     white-space: pre-wrap;

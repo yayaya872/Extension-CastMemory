@@ -13,6 +13,24 @@
                 </label>
             </div>
 
+            <div class="cm-row">
+                <label for="cm_injection">
+                    <span>注入方式</span>
+                    <small class="cm-hint">「拡張プロンプトブロック」はSTのプロンプトプレビュー／生プロンプトで注入内容を確認できます（チャット切替のたびに自動で再登録されます）。「インターセプター」は送信直前に割り込む方式で、プレビューには映りません。</small>
+                </label>
+                <select id="cm_injection" class="text_pole">
+                    <option value="interceptor">インターセプター（確実）</option>
+                    <option value="extension">拡張プロンプトブロック（生プロンプトで確認可）</option>
+                </select>
+            </div>
+
+            <div class="cm-row">
+                <label class="checkbox_label" for="cm_ghost">
+                    <input type="checkbox" id="cm_ghost" />
+                    <span>記憶に取り込まれたメッセージをゴースト表示（半透明）にする</span>
+                </label>
+            </div>
+
             <div class="cm-status-box" id="cm_status">—</div>
             <div class="cm-hint" id="cm_diag">diag: —</div>
 

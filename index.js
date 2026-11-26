@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.0.7';
+const VERSION = '2.1.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -70,6 +70,8 @@ function newId() {
 
 const defaultSettings = Object.freeze({
     enabled: true,
+    injectionMethod: 'interceptor', // 'interceptor' | 'extension'
+    ghostVisuals: true,             // fade memory-covered messages in the chat UI
     keepTailMessages: 10,        // newest chat messages always kept raw
     sceneThresholdTokens: 6000,  // unwritten tokens that force a mid-scene write
     sceneTurnLimit: 6,           // unwritten assistant turns that force a write
@@ -443,55 +445,93 @@ function recomputePresence(store) {
     }
 }
 
-// ─── Token estimation ────────────────────────────────────────────────────────
+// ─── Token counting ──────────────────────────────────────────────────────────
+// Counts go through ST's own tokenizer service, but batched: ONE POST
+// with every text as a {content} message returns the total (the server
+// adds 3 tokens per message + 3 padding, which we strip back off).
+// This replaces the old per-message getTokenCountAsync loop, whose
+// many sequential POSTs could each fail and poison the whole count
+// (and latch the extension into rough estimates for the session).
+// On failure: one retry, then a length estimate for that call only,
+// with a short cooldown before the server is tried again.
 
-const _tokenCache = new Map(); // chat index -> { mes, tokens }
 let lastTokenEstimate = -1;
 let lastUnwrittenEstimate = -1;
+let lastInjectedTokens = -1;
+let tokenCountSource = 'server'; // 'server' | 'estimate'
+let tokenFailUntil = 0;
+let tokenCountInFlight = false;
 
 function ignoreSymbol() {
     return SillyTavern.getContext().symbols.ignore;
 }
 
-/**
- * Token counting with a session-level circuit breaker. ST's counter can
- * fail for some custom endpoints (it shows "An unknown error occurred
- * while counting tokens"); when it does, fall back to a length estimate
- * and never call it again this session, so the failure can't repeat.
- */
-let tokenCounterBroken = false;
-async function countTokens(text) {
-    if (!text) return 0;
-    if (tokenCounterBroken) return Math.ceil(text.length / 2);
-    try {
-        return await SillyTavern.getContext().getTokenCountAsync(text, 0);
-    } catch (e) {
-        tokenCounterBroken = true;
-        warn('token counter failed; using length-based estimates for this session:', e);
-        return Math.ceil(text.length / 2);
+function estimateByLength(texts) {
+    return texts.reduce((a, t) => a + Math.ceil(String(t).length / 2), 0);
+}
+
+async function fetchTokenTotal(texts) {
+    const ctx = SillyTavern.getContext();
+    let model = '';
+    try { model = ctx.getTokenizerModel() || ''; } catch (e) { /* default mapping */ }
+    const headers = (() => {
+        try { return ctx.getRequestHeaders(); } catch (e) { return { 'Content-Type': 'application/json' }; }
+    })();
+    const res = await fetch(`/api/tokenizers/openai/count?model=${encodeURIComponent(model)}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(texts.map(t => ({ content: t }))),
+    });
+    if (!res.ok) throw new Error(`tokenizer service HTTP ${res.status}`);
+    const data = await res.json();
+    const raw = Number(data?.token_count);
+    if (!Number.isFinite(raw)) throw new Error('tokenizer service returned no count');
+    return Math.max(0, raw - 3 * texts.length - 3);
+}
+
+/** Total tokens for a list of texts (batched, resilient). */
+async function countTextsTotal(texts) {
+    const list = (texts || []).filter(t => typeof t === 'string' && t.length);
+    if (!list.length) return 0;
+    if (Date.now() < tokenFailUntil) {
+        tokenCountSource = 'estimate';
+        return estimateByLength(list);
     }
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const total = await fetchTokenTotal(list);
+            tokenCountSource = 'server';
+            return total;
+        } catch (e) {
+            if (attempt === 0) await sleep(400);
+            else {
+                tokenFailUntil = Date.now() + 30000;
+                tokenCountSource = 'estimate';
+                warn('batch token count failed; estimating for now:', e);
+            }
+        }
+    }
+    return estimateByLength(list);
 }
 
 async function estimateChatTokens() {
+    if (tokenCountInFlight) return lastTokenEstimate;
+    tokenCountInFlight = true;
     try {
         const { chat } = SillyTavern.getContext();
         const IGNORE = ignoreSymbol();
-        let total = 0;
-        for (let i = 0; i < chat.length; i++) {
-            const msg = chat[i];
-            if (!msg || !msg.mes) continue;
-            if (msg.is_system) continue;
+        const texts = [];
+        for (const msg of chat) {
+            if (!msg || !msg.mes || msg.is_system) continue;
             if (msg.extra?.[IGNORE]) continue;
-            const cached = _tokenCache.get(i);
-            if (cached && cached.mes === msg.mes) { total += cached.tokens; continue; }
-            const tokens = await countTokens(msg.mes);
-            _tokenCache.set(i, { mes: msg.mes, tokens });
-            total += tokens;
+            texts.push(msg.mes);
         }
-        lastTokenEstimate = total;
-        return total;
+        lastTokenEstimate = await countTextsTotal(texts);
+        return lastTokenEstimate;
     } catch (e) {
         return lastTokenEstimate;
+    } finally {
+        tokenCountInFlight = false;
     }
 }
 
@@ -499,7 +539,7 @@ const _textTokenCache = new Map();
 async function estimateTextTokens(text) {
     if (!text) return 0;
     if (_textTokenCache.has(text)) return _textTokenCache.get(text);
-    const tokens = await countTokens(text);
+    const tokens = await countTextsTotal([text]);
     _textTokenCache.set(text, tokens);
     return tokens;
 }
@@ -507,17 +547,15 @@ async function estimateTextTokens(text) {
 /** Tokens of chat messages in (fromExclusive, toInclusive] not yet ignored. */
 async function estimateRangeTokens(fromExclusive, toInclusive) {
     const { chat } = SillyTavern.getContext();
-    let total = 0;
+    const IGNORE = ignoreSymbol();
+    const texts = [];
     for (let i = fromExclusive + 1; i <= toInclusive && i < chat.length; i++) {
         const msg = chat[i];
         if (!msg || !msg.mes || msg.is_system) continue;
-        const cached = _tokenCache.get(i);
-        if (cached && cached.mes === msg.mes) { total += cached.tokens; continue; }
-        const tokens = await countTokens(msg.mes);
-        _tokenCache.set(i, { mes: msg.mes, tokens });
-        total += tokens;
+        if (msg.extra?.[IGNORE]) continue;
+        texts.push(msg.mes);
     }
-    return total;
+    return countTextsTotal(texts);
 }
 
 // ─── Sub-model calls ─────────────────────────────────────────────────────────
@@ -970,6 +1008,56 @@ function unapplyAll() {
     saveStore();
 }
 
+/**
+ * The furthest index that may be ghosted in one go: the largest
+ * memory-entry boundary not past writtenUpTo (never a partial entry,
+ * never anything unwritten). Pure.
+ */
+function ghostTarget(store) {
+    if (!store || store.writtenUpTo < 0) return -1;
+    let target = -1;
+    for (const end of entryBoundaries(store)) {
+        if (end <= store.writtenUpTo && end > target) target = end;
+    }
+    // Ranges written with no entries at all (empty passages) are safe.
+    return target >= 0 ? target : store.writtenUpTo;
+}
+
+/**
+ * Ghost everything already written, ignoring the keep-tail rule —
+ * the manual override for the current chat. Reversible via unapply.
+ */
+function ghostAllNow() {
+    const store = getStore();
+    if (!store) return -1;
+    const target = ghostTarget(store);
+    if (target <= store.appliedUpTo) return store.appliedUpTo;
+    store.appliedUpTo = target;
+    markAppliedMessages();
+    saveStore();
+    applyGhostStyles();
+    return target;
+}
+
+/**
+ * Visual ghosting: messages covered by memories (index <= appliedUpTo)
+ * are faded in the chat UI and get a ghost marker. The messages stay
+ * fully readable — only their prompt presence is gone (ignore flag).
+ */
+function applyGhostStyles() {
+    try {
+        const s = getSettings();
+        const store = getStore();
+        const active = !!(s.enabled && s.ghostVisuals && store && store.appliedUpTo >= 0);
+        const els = document.querySelectorAll('#chat .mes');
+        els.forEach(el => {
+            const id = Number(el.getAttribute('mesid'));
+            const on = active && Number.isInteger(id) && id <= store.appliedUpTo;
+            el.classList.toggle('cm-ghost', on);
+        });
+    } catch (e) { /* DOM is best-effort */ }
+}
+
 // ─── Folding (long-term compression) ─────────────────────────────────────────
 
 async function foldCharacter(name) {
@@ -1048,7 +1136,6 @@ function processNewBlocks() {
         const stripped = stripBlocks(m.mes);
         if (stripped !== m.mes) {
             m.mes = stripped;
-            _tokenCache.delete(i);
         }
         changed = true;
     }
@@ -1158,6 +1245,43 @@ async function assembleBlock(store, budgetTokens) {
 
 let lastGen = { at: 0, included: false, type: '' };
 let lastInjected = { at: 0, text: '' };
+let lastRegisteredBlock = null; // last text pushed via setExtensionPrompt
+
+/**
+ * Extension-prompt injection mode: register the assembled block with
+ * ST's prompt system so it appears in the prompt preview / raw prompt.
+ * Registrations are wiped by ST on every chat switch (clearChat), so
+ * this is re-run after chat changes, store updates and UI refreshes;
+ * the change guard keeps it to one call per actual content change.
+ */
+async function refreshExtensionPrompt() {
+    try {
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.setExtensionPrompt !== 'function') return;
+        const s = getSettings();
+        // extension_prompt_types.IN_PROMPT = 0, extension_prompt_roles.SYSTEM = 0
+        if (!s.enabled || s.injectionMethod !== 'extension') {
+            if (lastRegisteredBlock !== '' && lastRegisteredBlock !== null) {
+                ctx.setExtensionPrompt('cast_memory', '', 0, 0, false, 0);
+                lastRegisteredBlock = '';
+            }
+            return;
+        }
+        const store = getStore();
+        if (!store) return;
+        const block = await assembleBlock(store, s.memoryBudgetTokens + 800);
+        if (block === lastRegisteredBlock) return;
+        ctx.setExtensionPrompt('cast_memory', block, 0, 0, false, 0);
+        lastRegisteredBlock = block;
+        if (block) {
+            lastInjected = { at: Date.now(), text: block };
+            lastGen = { at: Date.now(), included: true, type: 'extension' };
+            estimateTextTokens(block).then(v => { lastInjectedTokens = v; }).catch(() => {});
+        }
+    } catch (e) {
+        warn('refreshExtensionPrompt error:', e);
+    }
+}
 
 globalThis.castMemoryInterceptor = async function (chatArray, _contextSize, _abort, type) {
     try {
@@ -1167,9 +1291,15 @@ globalThis.castMemoryInterceptor = async function (chatArray, _contextSize, _abo
         if (type === 'quiet' || type === 'impersonate') return;
         const store = getStore();
         if (!store) return;
+        if (s.injectionMethod === 'extension') {
+            // The block rides as a registered extension prompt instead.
+            lastGen.included = !!lastRegisteredBlock;
+            return;
+        }
         const block = await assembleBlock(store, s.memoryBudgetTokens + 800); // +800: roster/setting headroom
         if (!block) return;
         lastInjected = { at: Date.now(), text: block };
+        estimateTextTokens(block).then(v => { lastInjectedTokens = v; }).catch(() => {});
         chatArray.splice(0, 0, {
             name: 'Cast Memory',
             is_user: false,
@@ -1228,6 +1358,9 @@ function onMessageReceived() {
 
 function onChatChanged() {
     setTimeout(async () => {
+        lastInjected = { at: 0, text: '' };
+        lastInjectedTokens = -1;
+        lastRegisteredBlock = null; // ST wiped extension_prompts with the chat
         clampStoreToChat();
         processNewBlocks();
         markAppliedMessages(); // ignore flags don't survive a reload — re-assert
@@ -1365,6 +1498,46 @@ function buildWandMenuEntry() {
     menu.appendChild(entry);
 }
 
+/** Open ST's extension settings drawer at the Cast Memory section. */
+function openCmSettings() {
+    try {
+        const block = document.querySelector('.cm-settings');
+        if (block) {
+            const drawer = document.getElementById('extensions-settings-button');
+            const content = document.getElementById('extensions_settings2');
+            const isOpen = content && content.offsetParent !== null;
+            if (!isOpen && drawer) drawer.click();
+            setTimeout(() => {
+                try { block.scrollIntoView({ block: 'start', behavior: 'smooth' }); } catch (e) { /* noop */ }
+            }, 350);
+            return;
+        }
+    } catch (e) { /* fall through to the sheet */ }
+    openSheet('ops');
+}
+
+/** Quick-access buttons in ST's send form (#leftSendForm). */
+function buildSendFormButtons() {
+    if (document.getElementById('cm-sendbtns')) return;
+    const host = document.getElementById('leftSendForm');
+    if (!host) return;
+    const wrap = document.createElement('div');
+    wrap.id = 'cm-sendbtns';
+    const mk = (icon, title, fn) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'cm-sendbtn';
+        b.textContent = icon;
+        b.title = title;
+        b.addEventListener('click', (e) => { e.preventDefault(); fn(); });
+        return b;
+    };
+    wrap.appendChild(mk('🎭', 'Cast Memory：キャラクター', () => openSheet('cast')));
+    wrap.appendChild(mk('🌍', 'Cast Memory：ワールド', () => openSheet('world')));
+    wrap.appendChild(mk('⚙️', 'Cast Memory：設定', () => openCmSettings()));
+    host.appendChild(wrap);
+}
+
 // The sheet is plain content shown through SillyTavern's own Popup API —
 // the mobile-safe way to show overlay UI in ST (custom position:fixed
 // sheets are displaced by ST's transformed <html> containing block).
@@ -1384,6 +1557,7 @@ function buildSheetContent() {
         <div class="cm-view cm-view-ops" hidden>
             <div class="cm-ops-btns">
                 <button class="cm-btn" type="button" data-act="scene-close">🎬 場面を締めて記憶を書く</button>
+                <button class="cm-btn" type="button" data-act="ghost-all">👻 書込済みを一括ゴースト化</button>
                 <button class="cm-btn" type="button" data-act="rewind">🔁 最後の書き込みを取り消して書き直す</button>
                 <button class="cm-btn" type="button" data-act="unapply">↩️ 反映を解除（原文を全部戻す）</button>
                 <button class="cm-btn cm-btn-danger" type="button" data-act="clear">🗑 全データを消去</button>
@@ -1407,8 +1581,9 @@ function buildSheetContent() {
     return el;
 }
 
-function openSheet() {
-    if (cmPopupOpen) return;
+function openSheet(tab) {
+    if (tab) cmTab = tab;
+    if (cmPopupOpen) { renderSheet(); return; }
     const el = buildSheetContent();
     updateUI();
     try {
@@ -1774,6 +1949,17 @@ async function onSheetClick(e) {
             renderSheet();
             break;
         }
+        case 'ghost-all': {
+            const target = ghostTarget(store);
+            if (target < 0) { toastr.info('まだ記憶に書かれた範囲がありません', 'Cast Memory'); break; }
+            if (target <= store.appliedUpTo) { toastr.info('書込済みの範囲はすでに全部ゴースト化されています', 'Cast Memory'); break; }
+            if (!confirm(`メッセージ ${target} までをゴースト化します。直近を生で残すルールより優先して、書込済みの範囲を全部隠します（記憶は注入され続けます。「反映を解除」で戻せます）。`)) break;
+            const done = ghostAllNow();
+            try { await SillyTavern.getContext().saveChat(); } catch (err) { /* noop */ }
+            toastr.success(`メッセージ ${done} までゴースト化しました`, 'Cast Memory');
+            renderSheet();
+            break;
+        }
         case 'rewind': {
             if (isWorking) { toastr.info('作業中です…', 'Cast Memory'); break; }
             const st = getStore();
@@ -1811,7 +1997,15 @@ function statusText() {
     if (!store) return 'チャットが開かれていません';
     const names = characterNames(store);
     const present = presentNames(store).length;
-    const tok = lastTokenEstimate >= 0 ? `履歴 ≈ ${lastTokenEstimate} tok` : '履歴 ≈ ? tok';
+    const est = tokenCountSource === 'estimate' ? '（概算）' : '';
+    let tok;
+    if (lastTokenEstimate >= 0 && lastInjectedTokens >= 0) {
+        tok = `送信合計 ≈ ${lastTokenEstimate + lastInjectedTokens} tok${est}（履歴 ${lastTokenEstimate} ＋ 注入 ${lastInjectedTokens}）`;
+    } else if (lastTokenEstimate >= 0) {
+        tok = `履歴 ≈ ${lastTokenEstimate} tok${est}`;
+    } else {
+        tok = '履歴 ≈ ? tok';
+    }
     const unwritten = lastUnwrittenEstimate >= 0 ? `未書込 ≈ ${lastUnwrittenEstimate} tok` : '';
     const gen = !lastGen.at ? '前回生成: —' : (lastGen.included ? '前回生成: 記録あり ✓' : '前回生成: 記録なし');
     const work = isWorking ? ' · 記憶を作成中…' : '';
@@ -1849,6 +2043,8 @@ function updateUI() {
         const panelStatus = document.getElementById('cm_status');
         if (panelStatus) panelStatus.textContent = statusText();
     } catch (e) { /* UI is best-effort */ }
+    applyGhostStyles();
+    refreshExtensionPrompt().catch(() => {});
 }
 
 // ─── Settings panel actions ──────────────────────────────────────────────────
@@ -1889,6 +2085,8 @@ function syncSettingsForm() {
     const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
     const chk = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
     chk('cm_enabled', s.enabled);
+    chk('cm_ghost', s.ghostVisuals);
+    set('cm_injection', s.injectionMethod);
     set('cm_tail', s.keepTailMessages);
     set('cm_threshold', s.sceneThresholdTokens);
     set('cm_turns', s.sceneTurnLimit);
@@ -1924,6 +2122,16 @@ function bindSettings() {
     $(document).on('change', '#cm_enabled', function () {
         getSettings().enabled = $(this).prop('checked');
         saveSettings(); updateUI();
+    });
+    $(document).on('change', '#cm_ghost', function () {
+        getSettings().ghostVisuals = $(this).prop('checked');
+        saveSettings(); updateUI();
+    });
+    $(document).on('change', '#cm_injection', function () {
+        getSettings().injectionMethod = $(this).val();
+        lastRegisteredBlock = null; // force re-registration under the new mode
+        saveSettings(); updateUI();
+        toastr.info(`注入方式を「${$(this).val() === 'extension' ? '拡張プロンプトブロック' : 'インターセプター'}」に切り替えました`, 'Cast Memory');
     });
     num('cm_tail', 'keepTailMessages');
     num('cm_threshold', 'sceneThresholdTokens');
@@ -1964,6 +2172,7 @@ function initCastMemory() {
         }
         try { buildFabAndSheet(); } catch (e) { noteError('buildFabAndSheet', e); }
         try { buildWandMenuEntry(); } catch (e) { noteError('buildWandMenuEntry', e); }
+        try { buildSendFormButtons(); } catch (e) { noteError('buildSendFormButtons', e); }
         try { bindSettings(); } catch (e) { noteError('bindSettings', e); }
         try { bindActions(); } catch (e) { noteError('bindActions', e); }
         try { syncSettingsForm(); } catch (e) { noteError('syncSettingsForm', e); }
@@ -1977,6 +2186,9 @@ function initCastMemory() {
             if (!document.getElementById('cm-wand-entry')) {
                 try { buildWandMenuEntry(); } catch (e) { /* menu may not exist yet */ }
             }
+            if (!document.getElementById('cm-sendbtns')) {
+                try { buildSendFormButtons(); } catch (e) { /* form may not exist yet */ }
+            }
             reportDiag();
             if (cmWatchTries >= 60) clearInterval(cmWatch);
         }, 1000);
@@ -1984,6 +2196,8 @@ function initCastMemory() {
         const et = ctx.eventTypes;
         ctx.eventSource.on(et.MESSAGE_RECEIVED, onMessageReceived);
         ctx.eventSource.on(et.CHAT_CHANGED, onChatChanged);
+        if (et.CHARACTER_MESSAGE_RENDERED) ctx.eventSource.on(et.CHARACTER_MESSAGE_RENDERED, () => setTimeout(applyGhostStyles, 0));
+        if (et.USER_MESSAGE_RENDERED) ctx.eventSource.on(et.USER_MESSAGE_RENDERED, () => setTimeout(applyGhostStyles, 0));
         if (et.MESSAGE_DELETED) ctx.eventSource.on(et.MESSAGE_DELETED, onChatChanged);
         if (et.MESSAGE_EDITED) ctx.eventSource.on(et.MESSAGE_EDITED, onChatChanged);
         if (et.MESSAGE_SWIPED) ctx.eventSource.on(et.MESSAGE_SWIPED, onChatChanged);
@@ -2005,6 +2219,9 @@ if (typeof module !== 'undefined' && module.exports) {
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
         matchCharacterName, normalizeName, extractJsonCandidates, repairJsonStrings,
         rewindLastWrite, unwrapBodyText, renameCharacter,
+        countTextsTotal, ghostTarget, ghostAllNow, refreshExtensionPrompt,
+        getTokenCountSource: () => tokenCountSource,
+        resetTokenCounterState: () => { tokenFailUntil = 0; tokenCountSource = 'server'; },
         getStore, getSettings, markAppliedMessages, maybeWriteScene,
         getLastInjected: () => lastInjected,
     };
