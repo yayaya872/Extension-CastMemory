@@ -47,16 +47,39 @@ happens, in the same reply where it happens.
    with the full updated profile — it replaces the old one. Memories
    are kept.
 
-4. When the story establishes durable WORLD information for the first
-   time (a place's layout, an organization's rules, a recurring
-   location), record it:
+4. WORLD information is only the story's CONCEPT and initial setup
+   (era, setting premise, the main stage in one line — e.g. "Modern
+   Japan" / "The stage is ◯◯ Apartments"). Keep it small and emit it
+   once, at the start:
    <!-- castmemory world start
    ...
    castmemory world end -->
    The "..." is the world info itself, written directly as plain
    markdown prose — no labels or wrappers around it.
+   Do NOT put place details in the world block — places have their
+   own blocks (rule 5).
 
-5. A character's REAL NAME is revealed after they were registered
+5. PLACES are recorded like characters. The FIRST time a place is
+   described in detail (layout, atmosphere, who is there, what it is
+   used for), emit its block:
+   <!-- castmemory location start
+   Name: Place Name
+   ...
+   castmemory location end -->
+   The "..." is the place's detail itself, written directly as plain
+   markdown prose — no labels or wrappers around it. When a lasting
+   change to a place is established, emit the block again with the
+   full updated detail — it replaces the old one.
+
+   Whenever the scene's place CHANGES (or in the first reply of the
+   story), declare the current place:
+   <!-- castmemory: here Place Name -->
+   Only the current place's detail is kept in front of you; the
+   other places are listed by name only. Use each place's exact
+   registered name in here blocks — the injected <cast_memory>
+   location list shows them all, with 📍 on the current one.
+
+6. A character's REAL NAME is revealed after they were registered
    under a descriptive placeholder (e.g. 赤髪の戦士, 白いローブの
    魔道士): emit a rename block in the same reply where the name is
    revealed:

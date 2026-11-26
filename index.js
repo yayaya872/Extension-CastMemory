@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -39,20 +39,20 @@ function noteError(where, e) {
 function reportDiag() {
     const el = (typeof document !== 'undefined') ? document.getElementById('cm_diag') : null;
     if (!el) return;
-    const fabEl = document.getElementById('cm-fab');
+    const fabEl = document.getElementById("cm-float");
     const wand = document.getElementById('cm-wand-entry') ? 'OK' : 'NG';
     let geo = '';
     try {
         if (fabEl) {
             const r = fabEl.getBoundingClientRect();
             const cs = getComputedStyle(fabEl);
-            geo = ` | fabRect=${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`
+            geo = ` | floatRect=${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`
                 + ` disp=${cs.display} vis=${cs.visibility} pos=${cs.position}`;
         }
         geo += ` | popup=${cmPopupOpen ? 'open' : 'closed'}`;
         geo += ` | win=${window.innerWidth}x${window.innerHeight}`;
     } catch { /* diag must never throw */ }
-    el.textContent = `diag v${VERSION}: fab=${fabEl ? 'OK' : 'NG'} sheet=${cmSheetEl ? 'OK' : 'NG'} wand=${wand}`
+    el.textContent = `diag v${VERSION}: float=${fabEl ? 'OK' : 'NG'} sheet=${cmSheetEl ? 'OK' : 'NG'} wand=${wand}`
         + (cmErrors.length ? ` | errors: ${cmErrors.slice(-3).join(' ; ')}` : ' | errors: none')
         + geo;
 }
@@ -167,6 +167,8 @@ function emptyStore() {
         writtenUpTo: -1,
         appliedUpTo: -1,
         lastWrite: null,
+        locations: {},
+        currentLocation: '',
     };
 }
 
@@ -182,6 +184,11 @@ function getStore() {
     if (typeof store.worldSetting !== 'string') store.worldSetting = '';
     if (!Array.isArray(store.worldEntries)) store.worldEntries = [];
     if (store.lastWrite === undefined) store.lastWrite = null;
+    if (!store.locations || typeof store.locations !== 'object') store.locations = {};
+    if (typeof store.currentLocation !== 'string') store.currentLocation = '';
+    for (const loc of Object.values(store.locations)) {
+        if (typeof loc.detail !== 'string') loc.detail = '';
+    }
     if (typeof store.worldLongTerm !== 'string') store.worldLongTerm = '';
     if (!Array.isArray(store.presence)) store.presence = [];
     for (const k of ['parsedUpTo', 'writtenUpTo', 'appliedUpTo']) {
@@ -215,6 +222,17 @@ function getCharacter(store, name) {
     return store.characters[name];
 }
 
+function getLocation(store, name) {
+    if (!store.locations[name]) {
+        store.locations[name] = { detail: '', created: Date.now(), updated: Date.now() };
+    }
+    return store.locations[name];
+}
+
+function locationNames(store) {
+    return Object.keys(store.locations || {});
+}
+
 function characterNames(store) {
     return Object.keys(store.characters);
 }
@@ -237,6 +255,8 @@ function presentNames(store) {
 const LOGIN_RE = /<!--\s*castmemory:\s*login\s+([^>]+?)\s*-->/gi;
 const LOGOUT_RE = /<!--\s*castmemory:\s*logout\s+([^>]+?)\s*-->/gi;
 const RENAME_RE = /<!--\s*castmemory:\s*rename\s+(.+?)\s*(?:->|→|=>)\s*(.+?)\s*-->/gi;
+const HERE_RE = /<!--\s*castmemory:\s*here\s+([^>]+?)\s*-->/gi;
+const LOCATION_BLOCK_RE = /<!--\s*castmemory\s+location\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+location\s+end\s*-->/gi;
 const CHAR_BLOCK_RE = /<!--\s*castmemory\s+character\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+character\s+end\s*-->/gi;
 const WORLD_BLOCK_RE = /<!--\s*castmemory\s+world\s+start\s*\n([\s\S]*?)\n\s*castmemory\s+world\s+end\s*-->/gi;
 
@@ -269,6 +289,14 @@ function parseBlocks(text) {
     collect(LOGIN_RE, (mm) => ({ kind: 'login', name: mm[1].trim() }));
     collect(LOGOUT_RE, (mm) => ({ kind: 'logout', name: mm[1].trim() }));
     collect(RENAME_RE, (mm) => ({ kind: 'rename', name: mm[1].trim(), newName: mm[2].trim() }));
+    collect(HERE_RE, (mm) => ({ kind: 'here', name: mm[1].trim() }));
+    collect(LOCATION_BLOCK_RE, (mm) => {
+        const body = mm[1].trim();
+        const nameLine = body.split('\n').map(x => x.trim()).find(x => /^name\s*:/i.test(x));
+        const name = nameLine ? nameLine.replace(/^name\s*:\s*/i, '').trim() : '';
+        const detail = body.split('\n').filter(x => x !== nameLine).join('\n').trim();
+        return { kind: 'location', name, detail: unwrapBodyText(detail || body) };
+    });
     collect(CHAR_BLOCK_RE, (mm) => {
         const body = mm[1].trim();
         const nameLine = body.split('\n').map(x => x.trim()).find(x => /^name\s*:/i.test(x));
@@ -288,6 +316,8 @@ function stripBlocks(text) {
         .replace(LOGIN_RE, '')
         .replace(LOGOUT_RE, '')
         .replace(RENAME_RE, '')
+        .replace(HERE_RE, '')
+        .replace(LOCATION_BLOCK_RE, '')
         .replace(CHAR_BLOCK_RE, '')
         .replace(WORLD_BLOCK_RE, '')
         .replace(/\n{3,}/g, '\n\n')
@@ -364,6 +394,19 @@ function applyBlock(store, block, index) {
         case 'rename': {
             if (!block.name || !block.newName) return false;
             return renameCharacter(store, block.name, block.newName);
+        }
+        case 'location': {
+            if (!block.name) return false;
+            const loc = getLocation(store, block.name);
+            loc.detail = block.detail || loc.detail;
+            loc.updated = Date.now();
+            return true;
+        }
+        case 'here': {
+            if (!block.name) return false;
+            getLocation(store, block.name);
+            store.currentLocation = block.name;
+            return true;
         }
         case 'world': {
             if (!block.text) return false;
@@ -1180,6 +1223,25 @@ async function assembleBlock(store, budgetTokens) {
         sections.push({ key: 'worldSetting', text: `## World\n${store.worldSetting}`, priority: 1 });
     }
 
+    // Locations: the full list is cheap (one line each, always in);
+    // only the CURRENT location's detail is injected in full, so the
+    // location data in the prompt stays bounded no matter how many
+    // places the story visits.
+    const locNames = locationNames(store);
+    if (locNames.length) {
+        const list = locNames.map(n => {
+            const loc = store.locations[n];
+            const one = profileOneLiner(loc.detail);
+            const marker = n === store.currentLocation ? '📍 ' : '';
+            return `- ${marker}${n}${one ? ` — ${one}` : ''}`;
+        }).join('\n');
+        sections.push({ key: 'locations', text: `## Locations\n${list}`, priority: 1 });
+        const cur = store.currentLocation ? store.locations[store.currentLocation] : null;
+        if (cur && cur.detail) {
+            sections.push({ key: 'currentLocation', text: `## Current location: ${store.currentLocation}\n${cur.detail}`, priority: 1 });
+        }
+    }
+
     // World memory covering hidden history only.
     const worldMem = [];
     if (store.worldLongTerm) worldMem.push(store.worldLongTerm);
@@ -1382,101 +1444,131 @@ async function clearAllData() {
 
 // ─── UI: floating button + sheet ─────────────────────────────────────────────
 
-const RING_C = 2 * Math.PI * 20;
 
 let cmSheetEl = null;
 let cmPopupOpen = false;
 let cmTab = 'cast';           // 'cast' | 'world' | 'ops'
 let cmSelectedChar = null;    // character name open in detail view
+let cmSelectedLoc = null;     // location name open in detail view
+
+let cmLocExpanded = false;
 
 function buildFabAndSheet() {
     buildSheetContent();
-    if (document.getElementById('cm-fab')) return;
+    if (document.getElementById('cm-float')) return;
 
-    const fab = document.createElement('div');
-    fab.id = 'cm-fab';
-    fab.title = 'Cast Memory';
-    // Position is anchored from the top-left with viewport units, never
-    // bottom/right: ST sets perspective/transform on <html>, making it the
-    // containing block for fixed elements; on the phone layout that block
-    // collapses and bottom-anchored elements render above the screen.
-    fab.style.cssText = 'position:fixed;left:calc(100vw - 66px);top:calc(100vh - 148px);top:calc(100dvh - 148px);width:52px;height:52px;'
-        + 'border-radius:50%;background:#22242c;box-shadow:0 2px 10px rgba(0,0,0,0.5);'
-        + 'z-index:2147483647;display:block;visibility:visible;opacity:1;'
-        + 'cursor:pointer;touch-action:none;user-select:none;-webkit-user-select:none;';
-    fab.innerHTML = `
-        <svg viewBox="0 0 48 48" class="cm-ring-svg" style="position:absolute;inset:2px;width:48px;height:48px;transform:rotate(-90deg);pointer-events:none">
-            <circle cx="24" cy="24" r="20" fill="none" stroke="rgba(255,255,255,0.18)" stroke-width="3.5"></circle>
-            <circle class="cm-ring-fg" cx="24" cy="24" r="20" fill="none" stroke="#7bc47f" stroke-width="3.5" stroke-linecap="round"></circle>
-        </svg>
-        <span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:22px;pointer-events:none">🎭</span>
-        <span class="cm-fab-badge" style="display:none;position:absolute;top:-2px;right:-2px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#7bc47f;color:#1a1a1a;font-size:12px;font-weight:700;align-items:center;justify-content:center;pointer-events:none"></span>`;
-    document.body.appendChild(fab);
-    applyFabPosition();
-    bindFabDrag(fab);
+    const el = document.createElement('div');
+    el.id = 'cm-float';
+    el.title = 'Cast Memory';
+    // Position is anchored from the top with viewport units, never
+    // bottom/right: ST sets perspective/transform on <html>, making it
+    // the containing block for fixed elements; on the phone layout that
+    // block collapses and bottom-anchored elements render above the
+    // screen. Default spot is the top-left of the chat area.
+    el.style.cssText = 'position:fixed;left:10px;top:54px;width:min(78vw,340px);'
+        + 'z-index:2147483000;display:flex;flex-direction:column;gap:6px;'
+        + 'touch-action:none;user-select:none;-webkit-user-select:none;';
+    el.innerHTML = `
+        <div class="cm-pill" id="cm-pill-loc">
+            <div class="cm-pill-head" data-pill="loc">
+                <span class="cm-pill-ico">📍</span>
+                <span class="cm-loc-name">現在地未設定</span>
+                <span class="cm-pill-chev">▾</span>
+            </div>
+            <div class="cm-pill-body" hidden>
+                <div class="cm-loc-detail cm-md mes_text"></div>
+                <button class="cm-btn cm-btn-small cm-loc-open-sheet" type="button">シートで開く（編集・削除）</button>
+            </div>
+        </div>
+        <div class="cm-pill" id="cm-pill-tok">
+            <div class="cm-pill-head" data-pill="tok">
+                <span class="cm-pill-ico">🧮</span>
+                <span class="cm-tok-text">合計 ≈ ? tok</span>
+                <span class="cm-tok-sub"></span>
+            </div>
+            <div class="cm-tok-bar"><div class="cm-tok-bar-fg"></div></div>
+        </div>`;
+    document.body.appendChild(el);
+    applyFloatPosition();
+    bindFloatDrag(el);
+    el.querySelector('.cm-loc-open-sheet').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const store = getStore();
+        if (store && store.currentLocation) cmSelectedLoc = store.currentLocation;
+        openSheet('world');
+    });
 }
 
-function applyFabPosition() {
-    const fab = document.getElementById('cm-fab');
-    if (!fab) return;
+function applyFloatPosition() {
+    const el = document.getElementById('cm-float');
+    if (!el) return;
     const s = getSettings();
     if (Number.isFinite(s.iconLeft) && Number.isFinite(s.iconTop)) {
-        const w = fab.offsetWidth || 52;
-        const h = fab.offsetHeight || 52;
+        const w = el.offsetWidth || 200;
         const ok = s.iconLeft > -w + 16 && s.iconLeft < window.innerWidth - 16
             && s.iconTop >= 0 && s.iconTop < window.innerHeight - 16;
         if (ok) {
-            fab.style.left = `${s.iconLeft}px`;
-            fab.style.top = `${s.iconTop}px`;
-            fab.style.right = 'auto';
-            fab.style.bottom = 'auto';
+            el.style.left = `${s.iconLeft}px`;
+            el.style.top = `${s.iconTop}px`;
+            el.style.right = 'auto';
+            el.style.bottom = 'auto';
             return;
         }
         delete s.iconLeft;
         delete s.iconTop;
         saveSettings();
     }
-    fab.style.left = 'calc(100vw - 66px)';
-    fab.style.top = 'calc(100vh - 148px)';
-    fab.style.top = 'calc(100dvh - 148px)';
-    fab.style.right = 'auto';
-    fab.style.bottom = 'auto';
+    el.style.left = '10px';
+    el.style.top = '54px';
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
 }
 
-function bindFabDrag(fab) {
-    let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false, moved = false;
-    fab.addEventListener('pointerdown', (e) => {
-        const rect = fab.getBoundingClientRect();
+function bindFloatDrag(el) {
+    let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false, moved = false, captured = false;
+    el.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.cm-pill-body')) return; // let body content (scroll, button) behave
+        const rect = el.getBoundingClientRect();
         startX = e.clientX; startY = e.clientY;
         origLeft = rect.left; origTop = rect.top;
-        dragging = true; moved = false;
-        fab.setPointerCapture(e.pointerId);
-        e.preventDefault();
+        dragging = true; moved = false; captured = false;
     });
-    fab.addEventListener('pointermove', (e) => {
+    el.addEventListener('pointermove', (e) => {
         if (!dragging) return;
         const dx = e.clientX - startX, dy = e.clientY - startY;
         if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
         if (!moved) return;
-        const w = fab.offsetWidth, h = fab.offsetHeight;
-        const left = Math.min(Math.max(0, origLeft + dx), window.innerWidth - w);
-        const top = Math.min(Math.max(0, origTop + dy), window.innerHeight - h);
-        fab.style.left = `${left}px`;
-        fab.style.top = `${top}px`;
-        fab.style.right = 'auto';
-        fab.style.bottom = 'auto';
+        if (!captured) {
+            try { el.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+            captured = true;
+        }
+        e.preventDefault();
+        const w = el.offsetWidth, h = el.offsetHeight;
+        const left = Math.min(Math.max(0, origLeft + dx), window.innerWidth - Math.min(w, window.innerWidth));
+        const top = Math.min(Math.max(0, origTop + dy), window.innerHeight - 30);
+        el.style.left = `${left}px`;
+        el.style.top = `${top}px`;
+        el.style.right = 'auto';
+        el.style.bottom = 'auto';
     });
-    fab.addEventListener('pointerup', () => {
+    el.addEventListener('pointerup', (e) => {
         if (!dragging) return;
         dragging = false;
         if (moved) {
-            const rect = fab.getBoundingClientRect();
+            const rect = el.getBoundingClientRect();
             const s = getSettings();
-            s.iconLeft = Math.round(Math.min(Math.max(0, rect.left), window.innerWidth - fab.offsetWidth));
-            s.iconTop = Math.round(Math.min(Math.max(0, rect.top), window.innerHeight - fab.offsetHeight));
+            s.iconLeft = Math.round(Math.min(Math.max(0, rect.left), window.innerWidth - 40));
+            s.iconTop = Math.round(Math.min(Math.max(0, rect.top), window.innerHeight - 30));
             saveSettings();
-        } else {
-            openSheet();
+            return;
+        }
+        const head = e.target.closest('[data-pill]');
+        if (!head) return;
+        if (head.dataset.pill === 'loc') {
+            cmLocExpanded = !cmLocExpanded;
+            updateFloat();
+        } else if (head.dataset.pill === 'tok') {
+            openSheet('ops');
         }
     });
 }
@@ -1519,10 +1611,13 @@ function openCmSettings() {
 /** Quick-access buttons in ST's send form (#leftSendForm). */
 function buildSendFormButtons() {
     if (document.getElementById('cm-sendbtns')) return;
-    const host = document.getElementById('leftSendForm');
-    if (!host) return;
+    // A slim bar directly ABOVE the send form, left-aligned — the left
+    // send-form area itself is crowded with ST's own buttons.
+    const form = document.getElementById('send_form');
+    if (!form || !form.parentElement) return;
     const wrap = document.createElement('div');
     wrap.id = 'cm-sendbtns';
+    wrap.className = 'cm-quickbar';
     const mk = (icon, title, fn) => {
         const b = document.createElement('button');
         b.type = 'button';
@@ -1533,9 +1628,9 @@ function buildSendFormButtons() {
         return b;
     };
     wrap.appendChild(mk('🎭', 'Cast Memory：キャラクター', () => openSheet('cast')));
-    wrap.appendChild(mk('🌍', 'Cast Memory：ワールド', () => openSheet('world')));
+    wrap.appendChild(mk('🌍', 'Cast Memory：ワールド・場所', () => openSheet('world')));
     wrap.appendChild(mk('⚙️', 'Cast Memory：設定', () => openCmSettings()));
-    host.appendChild(wrap);
+    form.parentElement.insertBefore(wrap, form);
 }
 
 // The sheet is plain content shown through SillyTavern's own Popup API —
@@ -1731,10 +1826,59 @@ function renderWorldView() {
     if (!view) return;
     const store = getStore();
     if (!store) { view.innerHTML = '<div class="cm-empty">チャットが開かれていません</div>'; return; }
+
+    // Location detail view (selected from the list below).
+    if (cmSelectedLoc && store.locations[cmSelectedLoc]) {
+        const name = cmSelectedLoc;
+        const loc = store.locations[name];
+        const isCur = store.currentLocation === name;
+        view.innerHTML = `
+            <div class="cm-detail-head">
+                <button class="cm-btn cm-btn-small" type="button" data-act="loc-back">← ワールドへ</button>
+                <span class="cm-detail-name">📍 ${escapeHtml(name)}</span>
+                ${isCur ? '<span class="cm-badge cm-badge-live">現在地</span>' : ''}
+            </div>
+            <div class="cm-detail-btns">
+                <button class="cm-btn cm-btn-small" type="button" data-act="loc-here" data-name="${encName(name)}">${isCur ? '現在地を解除' : '現在地に設定'}</button>
+                <button class="cm-btn cm-btn-small cm-btn-danger" type="button" data-act="loc-del" data-name="${encName(name)}">場所を削除</button>
+            </div>
+            <div class="cm-section-title">場所の詳細</div>
+            <div class="cm-md mes_text">${loc.detail ? renderMd(loc.detail, '') : '<span class="cm-empty">（未登録）</span>'}</div>
+            <div class="cm-editbox cm-loc-edit" hidden>
+                <textarea class="cm-edit-text text_pole" rows="8">${escapeHtml(loc.detail)}</textarea>
+                <div class="cm-entry-btns">
+                    <button class="cm-btn cm-btn-small" type="button" data-act="loc-save" data-name="${encName(name)}">保存</button>
+                    <button class="cm-btn cm-btn-small" type="button" data-act="loc-cancel">キャンセル</button>
+                </div>
+            </div>
+            <button class="cm-btn cm-btn-small" type="button" data-act="loc-edit">詳細を編集</button>`;
+        return;
+    }
+
+    const locNames = locationNames(store);
+    const locHtml = locNames.length
+        ? locNames.map(n => {
+            const loc = store.locations[n];
+            const one = profileOneLiner(loc.detail);
+            const cur = store.currentLocation === n;
+            return `<div class="cm-char-row" data-act="loc-open" data-name="${encName(n)}">
+                <span class="cm-char-name">${cur ? '📍 ' : ''}${escapeHtml(n)}</span>
+                ${cur ? '<span class="cm-badge cm-badge-live">現在地</span>' : ''}
+                <span class="cm-char-one">${escapeHtml(one)}</span>
+            </div>`;
+        }).join('')
+        : '<div class="cm-empty">場所はまだ登録されていません</div>';
+
     const entries = store.worldEntries.length
         ? store.worldEntries.map(e => entryHtml(e, 'world', '')).join('')
         : '<div class="cm-empty">ワールド記憶はまだありません</div>';
     view.innerHTML = `
+        <div class="cm-section-title">場所（${locNames.length}件）</div>
+        ${locHtml}
+        <div class="cm-addchar">
+            <input class="cm-addloc-name text_pole" type="text" placeholder="場所名を入力して手動追加" />
+            <button class="cm-btn cm-btn-small" type="button" data-act="loc-add">追加</button>
+        </div>
         <div class="cm-section-title">ワールド情報（設定）</div>
         <div class="cm-md mes_text">${store.worldSetting ? renderMd(store.worldSetting, '') : '<span class="cm-empty">（未登録）</span>'}</div>
         <div class="cm-editbox cm-world-edit" hidden>
@@ -1801,7 +1945,7 @@ async function onSheetClick(e) {
             store.presence.push({ index: Math.max(0, (chat?.length || 1) - 1), name, action: ch.present ? 'login' : 'logout' });
             saveStore();
             renderSheet();
-            updateFab();
+            updateFloat();
             break;
         }
         case 'char-rename': {
@@ -1855,6 +1999,63 @@ async function onSheetClick(e) {
                 toastr.success('プロフィールを保存しました', 'Cast Memory');
             }
             renderSheet();
+            break;
+        }
+        case 'loc-open': {
+            cmSelectedLoc = decName(btn.dataset.name);
+            cmTab = 'world';
+            renderSheet();
+            break;
+        }
+        case 'loc-back':
+            cmSelectedLoc = null;
+            renderSheet();
+            break;
+        case 'loc-add': {
+            const input = cmSheetEl.querySelector('.cm-addloc-name');
+            const name = (input?.value || '').trim();
+            if (!name) { toastr.warning('場所名を入力してください', 'Cast Memory'); break; }
+            getLocation(store, name);
+            saveStore();
+            cmSelectedLoc = name;
+            updateUI();
+            toastr.success(`場所「${name}」を追加しました`, 'Cast Memory');
+            break;
+        }
+        case 'loc-del': {
+            const name = decName(btn.dataset.name);
+            if (!confirm(`場所「${name}」を削除しますか？`)) break;
+            delete store.locations[name];
+            if (store.currentLocation === name) store.currentLocation = '';
+            if (cmSelectedLoc === name) cmSelectedLoc = null;
+            saveStore();
+            updateUI();
+            break;
+        }
+        case 'loc-here': {
+            const name = decName(btn.dataset.name);
+            store.currentLocation = store.currentLocation === name ? '' : name;
+            saveStore();
+            updateUI();
+            break;
+        }
+        case 'loc-edit':
+            cmSheetEl.querySelector('.cm-loc-edit').hidden = false;
+            break;
+        case 'loc-cancel':
+            cmSheetEl.querySelector('.cm-loc-edit').hidden = true;
+            break;
+        case 'loc-save': {
+            const name = decName(btn.dataset.name);
+            const ta = cmSheetEl.querySelector('.cm-loc-edit .cm-edit-text');
+            const loc = store.locations[name];
+            if (ta && loc) {
+                loc.detail = ta.value.trim();
+                loc.updated = Date.now();
+                saveStore();
+                toastr.success('場所の詳細を保存しました', 'Cast Memory');
+            }
+            updateUI();
             break;
         }
         case 'world-edit':
@@ -2014,31 +2215,61 @@ function statusText() {
     return `${tok}${unwritten ? ` ／ ${unwritten}` : ''} ／ キャラ ${names.length}（登場中 ${present}） ／ 書込済 msg ${store.writtenUpTo}・反映済 msg ${store.appliedUpTo} ／ ${gen}${work}${err}${drop}`;
 }
 
-function updateFab() {
-    const fab = document.getElementById('cm-fab');
-    if (!fab) return;
+function updateFloat() {
+    const el = document.getElementById('cm-float');
+    if (!el) return;
     const s = getSettings();
-    const ring = fab.querySelector('.cm-ring-fg');
-    if (ring) {
+    const store = getStore();
+
+    // Location pill: current place name + expandable detail.
+    const locName = el.querySelector('.cm-loc-name');
+    const cur = store?.currentLocation || '';
+    if (locName) locName.textContent = cur || '現在地未設定';
+    const chev = el.querySelector('.cm-pill-chev');
+    if (chev) chev.textContent = cmLocExpanded ? '▴' : '▾';
+    const body = el.querySelector('.cm-pill-body');
+    if (body) {
+        body.hidden = !cmLocExpanded;
+        if (cmLocExpanded) {
+            const detail = el.querySelector('.cm-loc-detail');
+            const loc = cur ? store?.locations[cur] : null;
+            if (detail) {
+                detail.innerHTML = loc?.detail
+                    ? renderMd(loc.detail, '')
+                    : '<span class="cm-empty">（この場所の詳細は未登録）</span>';
+            }
+        }
+    }
+
+    // Token pill: total + unwritten progress bar (replaces the FAB ring).
+    const tokText = el.querySelector('.cm-tok-text');
+    if (tokText) {
+        if (lastTokenEstimate >= 0 && lastInjectedTokens >= 0) {
+            tokText.textContent = `合計 ≈ ${lastTokenEstimate + lastInjectedTokens} tok`;
+        } else if (lastTokenEstimate >= 0) {
+            tokText.textContent = `履歴 ≈ ${lastTokenEstimate} tok`;
+        } else {
+            tokText.textContent = '合計 ≈ ? tok';
+        }
+    }
+    const tokSub = el.querySelector('.cm-tok-sub');
+    if (tokSub) {
+        const n = store ? presentNames(store).length : 0;
+        tokSub.textContent = n > 0 ? `登場中 ${n}` : '';
+    }
+    const bar = el.querySelector('.cm-tok-bar-fg');
+    if (bar) {
         const frac = (s.sceneThresholdTokens > 0 && lastUnwrittenEstimate >= 0)
             ? Math.min(1, lastUnwrittenEstimate / s.sceneThresholdTokens) : 0;
-        ring.style.strokeDasharray = String(RING_C);
-        ring.style.strokeDashoffset = String(RING_C * (1 - frac));
-        ring.style.stroke = frac >= 1 ? '#e06c5f' : (frac >= 0.7 ? '#e0a458' : '#7bc47f');
+        bar.style.width = `${Math.round(frac * 100)}%`;
+        bar.style.background = frac >= 1 ? '#e06c5f' : (frac >= 0.7 ? '#e0a458' : '#7bc47f');
     }
-    const badge = fab.querySelector('.cm-fab-badge');
-    const store = getStore();
-    const n = store ? presentNames(store).length : 0;
-    if (badge) {
-        badge.style.display = n > 0 ? 'flex' : 'none';
-        badge.textContent = String(n);
-    }
-    fab.style.opacity = s.enabled ? '1' : '0.45';
+    el.style.opacity = s.enabled ? '1' : '0.45';
 }
 
 function updateUI() {
     try {
-        updateFab();
+        updateFloat();
         if (cmSheetEl) renderSheet();
         const panelStatus = document.getElementById('cm_status');
         if (panelStatus) panelStatus.textContent = statusText();
@@ -2180,7 +2411,7 @@ function initCastMemory() {
         let cmWatchTries = 0;
         const cmWatch = setInterval(() => {
             cmWatchTries++;
-            if (!document.getElementById('cm-fab')) {
+            if (!document.getElementById("cm-float")) {
                 try { buildFabAndSheet(); } catch (e) { noteError('watchdog/buildFabAndSheet', e); }
             }
             if (!document.getElementById('cm-wand-entry')) {
@@ -2218,7 +2449,7 @@ if (typeof module !== 'undefined' && module.exports) {
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
         matchCharacterName, normalizeName, extractJsonCandidates, repairJsonStrings,
-        rewindLastWrite, unwrapBodyText, renameCharacter,
+        rewindLastWrite, unwrapBodyText, renameCharacter, getLocation, locationNames,
         countTextsTotal, ghostTarget, ghostAllNow, refreshExtensionPrompt,
         getTokenCountSource: () => tokenCountSource,
         resetTokenCounterState: () => { tokenFailUntil = 0; tokenCountSource = 'server'; },

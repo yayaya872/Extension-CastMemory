@@ -27,8 +27,9 @@ This repository is the merged edition built on Stockpile Memory
    entries — as JSON, stored per character.
 3. **Injection.** A `generate_interceptor` splices a `<cast_memory>`
    block into the exact outgoing chat array: the roster (who is on
-   stage), world setting + world memory, and for each on-stage
-   character their profile and their own memories. Off-stage
+   stage), world setting + world memory, the location list (one line
+   each) with only the CURRENT location's detail in full, and for each
+   on-stage character their profile and their own memories. Off-stage
    characters contribute only folded long-term memory, within budget.
 4. **Hiding, safely.** Messages whose range is covered by written
    memories are flagged with SillyTavern's ignore symbol and leave the
@@ -41,20 +42,23 @@ long-term memory) when they grow past a size threshold.
 
 ## UI
 
-The 🎭 floating button (draggable; badge = characters on stage, ring =
-unwritten tokens toward the next mid-scene write) opens a sheet with
-three tabs:
+Two floating pills (draggable, top-left by default) sit over the chat:
+a 📍 current-location pill — tap it and the place's detail expands in
+place — and a token pill showing the send total with an unwritten-
+progress bar; tapping it opens the sheet. The sheet has three tabs:
 
 - **Characters** — the roster; tap a character for their profile and
   memories, rendered as markdown. Profiles are editable; presence can
   be toggled by hand; every memory entry can show its original
   messages or be deleted.
-- **World** — world setting (from world blocks, editable) and world
-  memory entries with the same original-text view.
+- **World** — the location list (tap for detail; set the current
+  place by hand), world setting (concept only, from world blocks,
+  editable) and world memory entries with the same original-text view.
 - **Ops** — close the scene and write memories now, un-apply (send all
   originals again), add a character manually, wipe all data.
 
-The same sheet is reachable from the wand (extensions) menu.
+The same sheet is reachable from the wand (extensions) menu and from
+the quick bar above the message input.
 
 ## Data & reversibility
 
