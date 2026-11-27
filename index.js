@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -994,6 +994,7 @@ async function maybeWriteScene(manual = false) {
     if (!manual && !((nobodyPresent && enoughTurns) || overThreshold || turnLimitHit)) return false;
 
     isWorking = true;
+    updateFloat();
     try {
         const ok = await writeMemoriesForRange(start, end);
         if (ok) {
@@ -1482,8 +1483,6 @@ let cmTab = 'cast';           // 'cast' | 'world' | 'ops'
 let cmSelectedChar = null;    // character name open in detail view
 let cmSelectedLoc = null;     // location name open in detail view
 
-let cmLocExpanded = false;
-
 function buildFabAndSheet() {
     buildSheetContent();
     if (document.getElementById('cm-float')) return;
@@ -1496,30 +1495,24 @@ function buildFabAndSheet() {
     // the containing block for fixed elements; on the phone layout that
     // block collapses and bottom-anchored elements render above the
     // screen. Default spot is the top-left of the chat area.
-    el.style.cssText = 'position:fixed;left:10px;top:54px;width:min(46vw,190px);'
+    el.style.cssText = 'position:fixed;left:10px;top:54px;'
         + 'z-index:2147483000;display:block;'
         + 'touch-action:none;user-select:none;-webkit-user-select:none;';
     el.innerHTML = `
-        <div class="cm-card">
-            <div class="cm-row" data-pill="loc">
+        <div class="cm-fab-wrap">
+            <button class="cm-fab" type="button" title="Cast Memory を開く">
+                <span class="cm-fab-face">🎭</span>
+                <span class="cm-fab-spinner" hidden></span>
+                <span class="cm-fab-badge" hidden>0</span>
+            </button>
+            <div class="cm-loc-chip" data-pill="loc" title="現在地（タップでワールドを開く）">
                 <span class="cm-pin">📍</span>
                 <span class="cm-loc-name">現在地未設定</span>
-                <span class="cm-chev">▾</span>
-            </div>
-            <div class="cm-loc-body" hidden>
-                <div class="cm-loc-detail cm-md mes_text"></div>
-                <button class="cm-btn cm-btn-small cm-loc-open-sheet" type="button">シートで開く（編集・削除）</button>
             </div>
         </div>`;
     document.body.appendChild(el);
     applyFloatPosition();
     bindFloatDrag(el);
-    el.querySelector('.cm-loc-open-sheet').addEventListener('click', (e) => {
-        e.stopPropagation();
-        const store = getStore();
-        if (store && store.currentLocation) cmSelectedLoc = store.currentLocation;
-        openSheet('world');
-    });
 }
 
 function applyFloatPosition() {
@@ -1550,7 +1543,6 @@ function applyFloatPosition() {
 function bindFloatDrag(el) {
     let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false, moved = false, captured = false;
     el.addEventListener('pointerdown', (e) => {
-        if (e.target.closest('.cm-loc-body')) return; // let body content (scroll, button) behave
         const rect = el.getBoundingClientRect();
         startX = e.clientX; startY = e.clientY;
         origLeft = rect.left; origTop = rect.top;
@@ -1585,11 +1577,16 @@ function bindFloatDrag(el) {
             saveSettings();
             return;
         }
+        if (e.target.closest('.cm-fab')) {
+            openSheet();
+            return;
+        }
         const head = e.target.closest('[data-pill]');
         if (!head) return;
         if (head.dataset.pill === 'loc') {
-            cmLocExpanded = !cmLocExpanded;
-            updateFloat();
+            const store = getStore();
+            if (store && store.currentLocation) cmSelectedLoc = store.currentLocation;
+            openSheet('world');
         }
     });
 }
@@ -1665,6 +1662,24 @@ function buildSheetContent() {
     const el = document.createElement('div');
     el.className = 'cm-sheet-content';
     el.innerHTML = `
+        <div class="cm-titlebar">
+            <span class="cm-dot cm-dot-r"></span>
+            <span class="cm-dot cm-dot-y"></span>
+            <span class="cm-dot cm-dot-g"></span>
+            <span class="cm-title">🎭 Cast Memory</span>
+            <span class="cm-title-ver">v${VERSION}</span>
+        </div>
+        <div class="cm-tracker">
+            <div class="cm-tcard cm-tcard-loc" data-act="tracker-loc">
+                <div class="cm-tlabel">現在地</div>
+                <div class="cm-tloc-name">現在地未設定</div>
+                <div class="cm-tloc-sub"></div>
+            </div>
+            <div class="cm-tcard">
+                <div class="cm-tlabel">登場中キャスト<span class="cm-tcount"></span></div>
+                <div class="cm-tcast"></div>
+            </div>
+        </div>
         <div class="cm-sheet-status"></div>
         <div class="cm-tabs">
             <button class="cm-tab" type="button" data-act="tab" data-tab="cast">🎭 キャラクター</button>
@@ -1918,8 +1933,41 @@ function renderWorldView() {
         ${entries}`;
 }
 
+/** Tracker cards at the top of the sheet: current location + the cast. */
+function renderTracker() {
+    if (!cmSheetEl) return;
+    const nameEl = cmSheetEl.querySelector('.cm-tloc-name');
+    if (!nameEl) return;
+    const subEl = cmSheetEl.querySelector('.cm-tloc-sub');
+    const castEl = cmSheetEl.querySelector('.cm-tcast');
+    const countEl = cmSheetEl.querySelector('.cm-tcount');
+    const store = getStore();
+    if (!store) {
+        nameEl.textContent = '—';
+        if (subEl) subEl.textContent = '';
+        if (countEl) countEl.textContent = '';
+        if (castEl) castEl.innerHTML = '';
+        return;
+    }
+    const cur = store.currentLocation || '';
+    nameEl.textContent = cur || '現在地未設定';
+    const loc = cur ? store.locations[cur] : null;
+    if (subEl) subEl.textContent = loc ? (profileOneLiner(loc.detail) || '') : '';
+    const present = presentNames(store);
+    if (countEl) countEl.textContent = present.length ? ` — ${present.length}人` : '';
+    if (castEl) {
+        const off = characterNames(store).filter(n => !present.includes(n));
+        const chips = present.map(n =>
+            `<span class="cm-tchip" data-act="tracker-char" data-name="${encName(n)}"><span class="cm-ton"></span>${escapeHtml(n)}</span>`).join('')
+            + off.map(n =>
+            `<span class="cm-tchip cm-tchip-off" data-act="tracker-char" data-name="${encName(n)}">${escapeHtml(n)}（退場中）</span>`).join('');
+        castEl.innerHTML = chips || '<span class="cm-tempty">まだキャラクターがいません</span>';
+    }
+}
+
 function renderSheet() {
     if (!cmSheetEl) return;
+    renderTracker();
     cmSheetEl.querySelectorAll('.cm-tab').forEach(t => {
         t.classList.toggle('cm-tab-active', t.dataset.tab === cmTab);
     });
@@ -1945,6 +1993,18 @@ async function onSheetClick(e) {
 
     if (act === 'tab') {
         cmTab = btn.dataset.tab;
+        renderSheet();
+        return;
+    }
+    if (act === 'tracker-loc') {
+        if (store && store.currentLocation) cmSelectedLoc = store.currentLocation;
+        cmTab = 'world';
+        renderSheet();
+        return;
+    }
+    if (act === 'tracker-char') {
+        cmSelectedChar = decName(btn.dataset.name);
+        cmTab = 'cast';
         renderSheet();
         return;
     }
@@ -2245,25 +2305,23 @@ function updateFloat() {
     const s = getSettings();
     const store = getStore();
 
-    // Location pill: current place name + expandable detail.
+    // Location chip: current place name only (no expansion).
     const locName = el.querySelector('.cm-loc-name');
-    const cur = store?.currentLocation || '';
-    if (locName) locName.textContent = cur || '現在地未設定';
-    const chev = el.querySelector('.cm-chev');
-    if (chev) chev.textContent = cmLocExpanded ? '▴' : '▾';
-    const body = el.querySelector('.cm-loc-body');
-    if (body) {
-        body.hidden = !cmLocExpanded;
-        if (cmLocExpanded) {
-            const detail = el.querySelector('.cm-loc-detail');
-            const loc = cur ? store?.locations[cur] : null;
-            if (detail) {
-                detail.innerHTML = loc?.detail
-                    ? renderMd(loc.detail, '')
-                    : '<span class="cm-empty">（この場所の詳細は未登録）</span>';
-            }
-        }
+    if (locName) locName.textContent = store?.currentLocation || '現在地未設定';
+
+    // Badge on the round button: number of characters on stage.
+    const badge = el.querySelector('.cm-fab-badge');
+    if (badge) {
+        const present = store ? presentNames(store).length : 0;
+        badge.textContent = String(present);
+        badge.hidden = present === 0;
     }
+
+    // While the sub model is writing memories, the mask becomes a spinner.
+    const face = el.querySelector('.cm-fab-face');
+    const spinner = el.querySelector('.cm-fab-spinner');
+    if (face) face.hidden = isWorking;
+    if (spinner) spinner.hidden = !isWorking;
 
     el.style.opacity = s.enabled ? '1' : '0.45';
 }

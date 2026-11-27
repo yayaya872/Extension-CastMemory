@@ -42,9 +42,13 @@ long-term memory) when they grow past a size threshold.
 
 ## UI
 
-A floating 📍 current-location card (draggable, top-left by default)
-sits over the chat — tap it and the place's detail expands in place.
-The sheet has three tabs:
+A floating cluster (draggable, top-left by default) sits over the
+chat: one round 🎭 button — its badge shows how many characters are
+on stage, and the mask turns into a spinner while the sub model is
+writing memories — next to a chip showing only the current location's
+name. Tap the button to open the sheet; tap the chip to open it on
+the World tab. The sheet opens with Marinara-style tracker cards
+(current location and the on-stage cast) above three tabs:
 
 - **Characters** — the roster; tap a character for their profile and
   memories, rendered as markdown. Profiles are editable; presence can
