@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.4.0';
+const VERSION = '2.5.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -123,6 +123,8 @@ Condense this into a shorter long-term memory. Preserve: relationship changes (f
 Condense this world memory into a shorter long-term record. Preserve: the current state of places and situations, key past events still affecting the present, promises and agreements, and unresolved threads. Drop detail that no longer matters. Output markdown lines only.`,
     iconLeft: null,
     iconTop: null,
+    locIconLeft: null,
+    locIconTop: null,
 });
 
 function getSettings() {
@@ -1485,62 +1487,83 @@ let cmSelectedLoc = null;     // location name open in detail view
 
 function buildFabAndSheet() {
     buildSheetContent();
-    if (document.getElementById('cm-float')) return;
+    buildFloatButton();
+    buildLocChip();
+}
 
+// The button float and the location float are separate elements, each
+// with its own saved position, so they can be dragged independently.
+// Position is anchored from the top with viewport units, never
+// bottom/right: ST sets perspective/transform on <html>, making it
+// the containing block for fixed elements; on the phone layout that
+// block collapses and bottom-anchored elements render above the
+// screen. Default spots are the top-left of the chat area.
+function floatBaseStyle() {
+    return 'position:fixed;z-index:2147483000;display:block;'
+        + 'touch-action:none;user-select:none;-webkit-user-select:none;';
+}
+
+function buildFloatButton() {
+    if (document.getElementById('cm-float')) return;
     const el = document.createElement('div');
     el.id = 'cm-float';
     el.title = 'Cast Memory';
-    // Position is anchored from the top with viewport units, never
-    // bottom/right: ST sets perspective/transform on <html>, making it
-    // the containing block for fixed elements; on the phone layout that
-    // block collapses and bottom-anchored elements render above the
-    // screen. Default spot is the top-left of the chat area.
-    el.style.cssText = 'position:fixed;left:10px;top:54px;'
-        + 'z-index:2147483000;display:block;'
-        + 'touch-action:none;user-select:none;-webkit-user-select:none;';
+    el.style.cssText = floatBaseStyle();
     el.innerHTML = `
-        <div class="cm-fab-wrap">
-            <button class="cm-fab" type="button" title="Cast Memory を開く">
-                <span class="cm-fab-face">🎭</span>
-                <span class="cm-fab-spinner" hidden></span>
-                <span class="cm-fab-badge" hidden>0</span>
-            </button>
-            <div class="cm-loc-chip" data-pill="loc" title="現在地（タップでワールドを開く）">
-                <span class="cm-pin">📍</span>
-                <span class="cm-loc-name">現在地未設定</span>
-            </div>
-        </div>`;
+        <button class="cm-fab" type="button" title="Cast Memory を開く">
+            <span class="cm-fab-face">🎭</span>
+            <span class="cm-fab-spinner" hidden></span>
+            <span class="cm-fab-badge" hidden>0</span>
+        </button>`;
     document.body.appendChild(el);
-    applyFloatPosition();
-    bindFloatDrag(el);
+    applyFloatPosition(el, 'iconLeft', 'iconTop', 10, 54);
+    bindFloatDrag(el, 'iconLeft', 'iconTop', () => openSheet());
 }
 
-function applyFloatPosition() {
-    const el = document.getElementById('cm-float');
+function buildLocChip() {
+    if (document.getElementById('cm-loc-float')) return;
+    const el = document.createElement('div');
+    el.id = 'cm-loc-float';
+    el.style.cssText = floatBaseStyle();
+    el.innerHTML = `
+        <div class="cm-loc-chip" title="現在地（タップでワールドを開く）">
+            <span class="cm-pin">📍</span>
+            <span class="cm-loc-name">現在地未設定</span>
+        </div>`;
+    document.body.appendChild(el);
+    applyFloatPosition(el, 'locIconLeft', 'locIconTop', 70, 65);
+    bindFloatDrag(el, 'locIconLeft', 'locIconTop', () => {
+        const store = getStore();
+        if (store && store.currentLocation) cmSelectedLoc = store.currentLocation;
+        openSheet('world');
+    });
+}
+
+function applyFloatPosition(el, keyL, keyT, defL, defT) {
     if (!el) return;
     const s = getSettings();
-    if (Number.isFinite(s.iconLeft) && Number.isFinite(s.iconTop)) {
-        const w = el.offsetWidth || 200;
-        const ok = s.iconLeft > -w + 16 && s.iconLeft < window.innerWidth - 16
-            && s.iconTop >= 0 && s.iconTop < window.innerHeight - 16;
+    if (Number.isFinite(s[keyL]) && Number.isFinite(s[keyT])) {
+        const w = el.offsetWidth || 60;
+        const ok = s[keyL] > -w + 16 && s[keyL] < window.innerWidth - 16
+            && s[keyT] >= 0 && s[keyT] < window.innerHeight - 16;
         if (ok) {
-            el.style.left = `${s.iconLeft}px`;
-            el.style.top = `${s.iconTop}px`;
+            el.style.left = `${s[keyL]}px`;
+            el.style.top = `${s[keyT]}px`;
             el.style.right = 'auto';
             el.style.bottom = 'auto';
             return;
         }
-        delete s.iconLeft;
-        delete s.iconTop;
+        delete s[keyL];
+        delete s[keyT];
         saveSettings();
     }
-    el.style.left = '10px';
-    el.style.top = '54px';
+    el.style.left = `${defL}px`;
+    el.style.top = `${defT}px`;
     el.style.right = 'auto';
     el.style.bottom = 'auto';
 }
 
-function bindFloatDrag(el) {
+function bindFloatDrag(el, keyL, keyT, onTap) {
     let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false, moved = false, captured = false;
     el.addEventListener('pointerdown', (e) => {
         const rect = el.getBoundingClientRect();
@@ -1566,28 +1589,18 @@ function bindFloatDrag(el) {
         el.style.right = 'auto';
         el.style.bottom = 'auto';
     });
-    el.addEventListener('pointerup', (e) => {
+    el.addEventListener('pointerup', () => {
         if (!dragging) return;
         dragging = false;
         if (moved) {
             const rect = el.getBoundingClientRect();
             const s = getSettings();
-            s.iconLeft = Math.round(Math.min(Math.max(0, rect.left), window.innerWidth - 40));
-            s.iconTop = Math.round(Math.min(Math.max(0, rect.top), window.innerHeight - 30));
+            s[keyL] = Math.round(Math.min(Math.max(0, rect.left), window.innerWidth - 40));
+            s[keyT] = Math.round(Math.min(Math.max(0, rect.top), window.innerHeight - 30));
             saveSettings();
             return;
         }
-        if (e.target.closest('.cm-fab')) {
-            openSheet();
-            return;
-        }
-        const head = e.target.closest('[data-pill]');
-        if (!head) return;
-        if (head.dataset.pill === 'loc') {
-            const store = getStore();
-            if (store && store.currentLocation) cmSelectedLoc = store.currentLocation;
-            openSheet('world');
-        }
+        onTap();
     });
 }
 
@@ -1629,31 +1642,6 @@ function openCmSettings() {
     openSheet('ops');
 }
 
-/** Quick-access buttons in ST's send form (#leftSendForm). */
-function buildSendFormButtons() {
-    if (document.getElementById('cm-sendbtns')) return;
-    // A slim bar directly ABOVE the send form, left-aligned — the left
-    // send-form area itself is crowded with ST's own buttons.
-    const form = document.getElementById('send_form');
-    if (!form || !form.parentElement) return;
-    const wrap = document.createElement('div');
-    wrap.id = 'cm-sendbtns';
-    wrap.className = 'cm-quickbar';
-    const mk = (icon, title, fn) => {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.className = 'cm-sendbtn';
-        b.textContent = icon;
-        b.title = title;
-        b.addEventListener('click', (e) => { e.preventDefault(); fn(); });
-        return b;
-    };
-    wrap.appendChild(mk('🎭', 'Cast Memory：キャラクター', () => openSheet('cast')));
-    wrap.appendChild(mk('🌍', 'Cast Memory：ワールド・場所', () => openSheet('world')));
-    wrap.appendChild(mk('⚙️', 'Cast Memory：設定', () => openCmSettings()));
-    form.parentElement.insertBefore(wrap, form);
-}
-
 // The sheet is plain content shown through SillyTavern's own Popup API —
 // the mobile-safe way to show overlay UI in ST (custom position:fixed
 // sheets are displaced by ST's transformed <html> containing block).
@@ -1662,24 +1650,6 @@ function buildSheetContent() {
     const el = document.createElement('div');
     el.className = 'cm-sheet-content';
     el.innerHTML = `
-        <div class="cm-titlebar">
-            <span class="cm-dot cm-dot-r"></span>
-            <span class="cm-dot cm-dot-y"></span>
-            <span class="cm-dot cm-dot-g"></span>
-            <span class="cm-title">🎭 Cast Memory</span>
-            <span class="cm-title-ver">v${VERSION}</span>
-        </div>
-        <div class="cm-tracker">
-            <div class="cm-tcard cm-tcard-loc" data-act="tracker-loc">
-                <div class="cm-tlabel">現在地</div>
-                <div class="cm-tloc-name">現在地未設定</div>
-                <div class="cm-tloc-sub"></div>
-            </div>
-            <div class="cm-tcard">
-                <div class="cm-tlabel">登場中キャスト<span class="cm-tcount"></span></div>
-                <div class="cm-tcast"></div>
-            </div>
-        </div>
         <div class="cm-sheet-status"></div>
         <div class="cm-tabs">
             <button class="cm-tab" type="button" data-act="tab" data-tab="cast">🎭 キャラクター</button>
@@ -1933,41 +1903,8 @@ function renderWorldView() {
         ${entries}`;
 }
 
-/** Tracker cards at the top of the sheet: current location + the cast. */
-function renderTracker() {
-    if (!cmSheetEl) return;
-    const nameEl = cmSheetEl.querySelector('.cm-tloc-name');
-    if (!nameEl) return;
-    const subEl = cmSheetEl.querySelector('.cm-tloc-sub');
-    const castEl = cmSheetEl.querySelector('.cm-tcast');
-    const countEl = cmSheetEl.querySelector('.cm-tcount');
-    const store = getStore();
-    if (!store) {
-        nameEl.textContent = '—';
-        if (subEl) subEl.textContent = '';
-        if (countEl) countEl.textContent = '';
-        if (castEl) castEl.innerHTML = '';
-        return;
-    }
-    const cur = store.currentLocation || '';
-    nameEl.textContent = cur || '現在地未設定';
-    const loc = cur ? store.locations[cur] : null;
-    if (subEl) subEl.textContent = loc ? (profileOneLiner(loc.detail) || '') : '';
-    const present = presentNames(store);
-    if (countEl) countEl.textContent = present.length ? ` — ${present.length}人` : '';
-    if (castEl) {
-        const off = characterNames(store).filter(n => !present.includes(n));
-        const chips = present.map(n =>
-            `<span class="cm-tchip" data-act="tracker-char" data-name="${encName(n)}"><span class="cm-ton"></span>${escapeHtml(n)}</span>`).join('')
-            + off.map(n =>
-            `<span class="cm-tchip cm-tchip-off" data-act="tracker-char" data-name="${encName(n)}">${escapeHtml(n)}（退場中）</span>`).join('');
-        castEl.innerHTML = chips || '<span class="cm-tempty">まだキャラクターがいません</span>';
-    }
-}
-
 function renderSheet() {
     if (!cmSheetEl) return;
-    renderTracker();
     cmSheetEl.querySelectorAll('.cm-tab').forEach(t => {
         t.classList.toggle('cm-tab-active', t.dataset.tab === cmTab);
     });
@@ -1993,18 +1930,6 @@ async function onSheetClick(e) {
 
     if (act === 'tab') {
         cmTab = btn.dataset.tab;
-        renderSheet();
-        return;
-    }
-    if (act === 'tracker-loc') {
-        if (store && store.currentLocation) cmSelectedLoc = store.currentLocation;
-        cmTab = 'world';
-        renderSheet();
-        return;
-    }
-    if (act === 'tracker-char') {
-        cmSelectedChar = decName(btn.dataset.name);
-        cmTab = 'cast';
         renderSheet();
         return;
     }
@@ -2300,30 +2225,33 @@ function statusText() {
 }
 
 function updateFloat() {
-    const el = document.getElementById('cm-float');
-    if (!el) return;
     const s = getSettings();
     const store = getStore();
 
-    // Location chip: current place name only (no expansion).
-    const locName = el.querySelector('.cm-loc-name');
-    if (locName) locName.textContent = store?.currentLocation || '現在地未設定';
-
-    // Badge on the round button: number of characters on stage.
-    const badge = el.querySelector('.cm-fab-badge');
-    if (badge) {
-        const present = store ? presentNames(store).length : 0;
-        badge.textContent = String(present);
-        badge.hidden = present === 0;
+    const el = document.getElementById('cm-float');
+    if (el) {
+        // Badge on the round button: number of characters on stage.
+        const badge = el.querySelector('.cm-fab-badge');
+        if (badge) {
+            const present = store ? presentNames(store).length : 0;
+            badge.textContent = String(present);
+            badge.hidden = present === 0;
+        }
+        // While the sub model is writing memories, the mask becomes a spinner.
+        const face = el.querySelector('.cm-fab-face');
+        const spinner = el.querySelector('.cm-fab-spinner');
+        if (face) face.hidden = isWorking;
+        if (spinner) spinner.hidden = !isWorking;
+        el.style.opacity = s.enabled ? '1' : '0.45';
     }
 
-    // While the sub model is writing memories, the mask becomes a spinner.
-    const face = el.querySelector('.cm-fab-face');
-    const spinner = el.querySelector('.cm-fab-spinner');
-    if (face) face.hidden = isWorking;
-    if (spinner) spinner.hidden = !isWorking;
-
-    el.style.opacity = s.enabled ? '1' : '0.45';
+    // Location chip float: current place name only (no expansion).
+    const chip = document.getElementById('cm-loc-float');
+    if (chip) {
+        const locName = chip.querySelector('.cm-loc-name');
+        if (locName) locName.textContent = store?.currentLocation || '現在地未設定';
+        chip.style.opacity = s.enabled ? '1' : '0.45';
+    }
 }
 
 function updateUI() {
@@ -2462,7 +2390,9 @@ function initCastMemory() {
         }
         try { buildFabAndSheet(); } catch (e) { noteError('buildFabAndSheet', e); }
         try { buildWandMenuEntry(); } catch (e) { noteError('buildWandMenuEntry', e); }
-        try { buildSendFormButtons(); } catch (e) { noteError('buildSendFormButtons', e); }
+        // The quick bar above the send form was removed in v2.5.0; clean
+        // up an element left over from an older version in this session.
+        document.getElementById('cm-sendbtns')?.remove();
         try { bindSettings(); } catch (e) { noteError('bindSettings', e); }
         try { bindActions(); } catch (e) { noteError('bindActions', e); }
         try { syncSettingsForm(); } catch (e) { noteError('syncSettingsForm', e); }
@@ -2470,14 +2400,11 @@ function initCastMemory() {
         let cmWatchTries = 0;
         const cmWatch = setInterval(() => {
             cmWatchTries++;
-            if (!document.getElementById("cm-float")) {
+            if (!document.getElementById("cm-float") || !document.getElementById("cm-loc-float")) {
                 try { buildFabAndSheet(); } catch (e) { noteError('watchdog/buildFabAndSheet', e); }
             }
             if (!document.getElementById('cm-wand-entry')) {
                 try { buildWandMenuEntry(); } catch (e) { /* menu may not exist yet */ }
-            }
-            if (!document.getElementById('cm-sendbtns')) {
-                try { buildSendFormButtons(); } catch (e) { /* form may not exist yet */ }
             }
             reportDiag();
             if (cmWatchTries >= 60) clearInterval(cmWatch);
