@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.2.2';
+const VERSION = '2.3.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -222,6 +222,28 @@ function getCharacter(store, name) {
     return store.characters[name];
 }
 
+function matchLocationName(store, key, allowContains = true) {
+    if (!key || !store || !store.locations) return null;
+    if (store.locations[key]) return key;
+    const nk = normalizeName(key);
+    if (!nk) return null;
+    const names = locationNames(store);
+    for (const n of names) {
+        if (normalizeName(n) === nk) return n;
+    }
+    if (!allowContains) return null;
+    const contains = names.filter(n => {
+        const nn = normalizeName(n);
+        return nn && (nk.includes(nn) || nn.includes(nk));
+    });
+    if (contains.length === 1) return contains[0];
+    if (contains.length > 1) {
+        contains.sort((a, b) => normalizeName(b).length - normalizeName(a).length);
+        return contains[0];
+    }
+    return null;
+}
+
 function getLocation(store, name) {
     if (!store.locations[name]) {
         store.locations[name] = { detail: '', created: Date.now(), updated: Date.now() };
@@ -397,15 +419,24 @@ function applyBlock(store, block, index) {
         }
         case 'location': {
             if (!block.name) return false;
-            const loc = getLocation(store, block.name);
+            // Snap spelling variants (spaces, reading annotations) to
+            // the registered place instead of duplicating it. No
+            // containment matching here: creating "Guild 2F" must not
+            // merge into "Guild".
+            const target = matchLocationName(store, block.name, false) || block.name;
+            const loc = getLocation(store, target);
             loc.detail = block.detail || loc.detail;
             loc.updated = Date.now();
             return true;
         }
         case 'here': {
             if (!block.name) return false;
-            getLocation(store, block.name);
-            store.currentLocation = block.name;
+            // "here" is a SELECTION from the list: snap near-miss
+            // names (including containment) to the registered place;
+            // only a genuine miss creates a new entry.
+            const target = matchLocationName(store, block.name, true) || block.name;
+            getLocation(store, target);
+            store.currentLocation = target;
             return true;
         }
         case 'world': {
@@ -1279,7 +1310,7 @@ async function assembleBlock(store, budgetTokens) {
     if (sections.length === 0) return '';
 
     sections.sort((a, b) => a.priority - b.priority);
-    const header = '<cast_memory>\n[Maintained records. Each character knows ONLY what is in their own memory below — never let a character act on events they did not witness. The roster shows who is on stage right now.]';
+    const header = '<cast_memory>\n[Maintained records. Each character knows ONLY what is in their own memory below — never let a character act on events they did not witness. The roster shows who is on stage right now. EVERY reply: declare the current place first with a castmemory "here" block, copying the name exactly from the Locations list; if the place is not listed, create it with a location block in the same reply.]';
     let out = header;
     let used = await estimateTextTokens(header);
     for (const sec of sections) {
@@ -2419,7 +2450,7 @@ if (typeof module !== 'undefined' && module.exports) {
         presentNames, characterNames, entryBoundaries, profileOneLiner,
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
         matchCharacterName, normalizeName, extractJsonCandidates, repairJsonStrings,
-        rewindLastWrite, unwrapBodyText, renameCharacter, getLocation, locationNames,
+        rewindLastWrite, unwrapBodyText, renameCharacter, getLocation, locationNames, matchLocationName,
         countTextsTotal, ghostTarget, ghostAllNow, refreshExtensionPrompt,
         getTokenCountSource: () => tokenCountSource,
         resetTokenCounterState: () => { tokenFailUntil = 0; tokenCountSource = 'server'; },

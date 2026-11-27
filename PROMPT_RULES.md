@@ -59,25 +59,25 @@ happens, in the same reply where it happens.
    Do NOT put place details in the world block — places have their
    own blocks (rule 5).
 
-5. PLACES are recorded like characters. The FIRST time a place is
-   described in detail (layout, atmosphere, who is there, what it is
-   used for), emit its block:
+5. PLACES: declare the current place in EVERY reply. At the start
+   of each reply, look at the Locations list in <cast_memory> and
+   declare where this reply's scene is:
+   <!-- castmemory: here Place Name -->
+   Copy the name exactly from the list — you are SELECTING from the
+   list, not describing a move. Only the current place's detail is
+   kept in front of you; the other places appear by name only.
+
+   If the scene's place is NOT in the list yet, create it in the
+   same reply, BEFORE the here block:
    <!-- castmemory location start
    Name: Place Name
    ...
    castmemory location end -->
-   The "..." is the place's detail itself, written directly as plain
+   The "..." is the place's detail itself (layout, atmosphere, who
+   is there, what it is used for), written directly as plain
    markdown prose — no labels or wrappers around it. When a lasting
-   change to a place is established, emit the block again with the
-   full updated detail — it replaces the old one.
-
-   Whenever the scene's place CHANGES (or in the first reply of the
-   story), declare the current place:
-   <!-- castmemory: here Place Name -->
-   Only the current place's detail is kept in front of you; the
-   other places are listed by name only. Use each place's exact
-   registered name in here blocks — the injected <cast_memory>
-   location list shows them all, with 📍 on the current one.
+   change to a place is established, emit the location block again
+   with the full updated detail — it replaces the old one.
 
 6. A character's REAL NAME is revealed after they were registered
    under a descriptive placeholder (e.g. 赤髪の戦士, 白いローブの
