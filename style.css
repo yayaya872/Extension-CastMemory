@@ -227,6 +227,7 @@
     cursor: pointer;
 }
 .cm-cp-send:disabled { opacity: 0.5; }
+.cm-cp-live { white-space: pre-wrap; }
 
 /* ─── Sheet (previous layout, Marinara-warm accents) ─── */
 .cm-sheet-content { text-align: left; }

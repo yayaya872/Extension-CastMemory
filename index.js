@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.6.0';
+const VERSION = '2.6.1';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -80,6 +80,7 @@ const defaultSettings = Object.freeze({
     summarizerResponseLength: 3000,
     connectionSource: 'profile', // 'default' | 'profile' | 'openai' | 'ollama'
     profileId: '',
+    consultProfileId: '', // Connection Manager profile for the consult window (enables streaming)
     openaiUrl: '',
     openaiKey: '',
     openaiModel: '',
@@ -1845,7 +1846,13 @@ function onConsultPanelClick(e) {
     }
     const btn = e.target.closest('[data-cp]');
     if (!btn) {
-        if (e.target.closest('.cm-cp-send')) sendConsult();
+        if (e.target.closest('.cm-cp-send')) {
+            if (consultBusy) {
+                if (consultAbort) consultAbort.abort();
+            } else {
+                sendConsult();
+            }
+        }
         return;
     }
     const act = btn.dataset.cp;
@@ -1898,6 +1905,51 @@ async function consultContextSnapshot(store) {
     return parts.join('\n\n');
 }
 
+let consultAbort = null;
+
+// Generates one consult reply. When a Connection Manager profile is
+// chosen for the consult window, the reply streams into the live
+// bubble; otherwise it falls back to generateRaw on the main
+// connection (whole reply at once).
+async function consultGenerate(ctx, systemPrompt, turns, liveEl) {
+    const s = getSettings();
+    const svc = ctx.ConnectionManagerRequestService;
+    if (s.consultProfileId && svc && typeof svc.sendRequest === 'function') {
+        const messages = [{ role: 'system', content: systemPrompt }, ...turns];
+        let text = '';
+        const ac = new AbortController();
+        consultAbort = ac;
+        try {
+            const res = await svc.sendRequest(s.consultProfileId, messages, 1200, {
+                stream: true, extractData: true, includePreset: false, signal: ac.signal,
+            });
+            if (typeof res === 'function') {
+                for await (const chunk of res()) {
+                    if (chunk && typeof chunk.text === 'string') text = chunk.text;
+                    if (liveEl) {
+                        liveEl.textContent = stripBlocks(text) || '…';
+                        const msgs = liveEl.closest('.cm-cp-msgs');
+                        if (msgs) msgs.scrollTop = msgs.scrollHeight;
+                    }
+                }
+                return text;
+            }
+            return (res && typeof res.content === 'string') ? res.content : '';
+        } catch (e) {
+            if (ac.signal.aborted) return text; // stopped by the user: keep what arrived
+            warn('consult streaming failed, retrying without streaming:', e);
+            const res = await svc.sendRequest(s.consultProfileId, messages, 1200, {
+                stream: false, extractData: true, includePreset: false,
+            });
+            return (res && typeof res.content === 'string') ? res.content : '';
+        } finally {
+            consultAbort = null;
+        }
+    }
+    const raw = await ctx.generateRaw({ systemPrompt, prompt: turns, responseLength: 1200 });
+    return String(raw || '');
+}
+
 async function sendConsult() {
     if (consultBusy) return;
     const panel = document.getElementById('cm-consult-panel');
@@ -1907,7 +1959,7 @@ async function sendConsult() {
     const store = getStore();
     if (!store) return;
     const ctx = SillyTavern.getContext();
-    if (typeof ctx.generateRaw !== 'function') {
+    if (typeof ctx.generateRaw !== 'function' && !getSettings().consultProfileId) {
         if (typeof toastr !== 'undefined') toastr.error('このSillyTavernでは相談窓の生成APIが使えません。');
         return;
     }
@@ -1918,7 +1970,23 @@ async function sendConsult() {
 
     consultBusy = true;
     const sendBtn = panel.querySelector('.cm-cp-send');
-    if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '…'; }
+    const canStop = !!getSettings().consultProfileId;
+    if (sendBtn) {
+        sendBtn.textContent = canStop ? '停止' : '…';
+        sendBtn.disabled = !canStop;
+    }
+    // Live bubble the streamed reply flows into (removed by the
+    // renderConsult in finally).
+    let liveEl = null;
+    const msgsEl = panel.querySelector('.cm-cp-msgs');
+    if (msgsEl) {
+        const wrap = document.createElement('div');
+        wrap.className = 'cm-cp-msg cm-cp-assistant';
+        wrap.innerHTML = '<div class="cm-cp-bubble cm-cp-live">…</div>';
+        msgsEl.appendChild(wrap);
+        liveEl = wrap.querySelector('.cm-cp-live');
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
     try {
         const snapshot = await consultContextSnapshot(store);
         const systemPrompt = snapshot ? `${CONSULT_SYSTEM_PROMPT}\n\n${snapshot}` : CONSULT_SYSTEM_PROMPT;
@@ -1926,7 +1994,7 @@ async function sendConsult() {
             .filter(m => m.role === 'user' || m.role === 'assistant')
             .slice(-20)
             .map(m => ({ role: m.role, content: m.text }));
-        const raw = await ctx.generateRaw({ systemPrompt, prompt: turns, responseLength: 1200 });
+        const raw = await consultGenerate(ctx, systemPrompt, turns, liveEl);
         const reply = cleanModelText(String(raw || ''));
         if (!reply) throw new Error('empty reply');
 
@@ -2635,14 +2703,19 @@ function bindActions() {
 // ─── Settings panel ──────────────────────────────────────────────────────────
 
 function populateProfiles() {
-    const select = document.getElementById('cm_profile');
-    if (!select) return;
+    const s = getSettings();
     try {
         const svc = SillyTavern.getContext().ConnectionManagerRequestService;
-        if (svc && typeof svc.handleDropdown === 'function') {
+        if (!svc || typeof svc.handleDropdown !== 'function') return;
+        const select = document.getElementById('cm_profile');
+        if (select) {
             svc.handleDropdown(select);
-            const s = getSettings();
             if (s.profileId) select.value = s.profileId;
+        }
+        const consultSelect = document.getElementById('cm_consult_profile');
+        if (consultSelect) {
+            svc.handleDropdown(consultSelect, s.consultProfileId || '');
+            consultSelect.value = s.consultProfileId || '';
         }
     } catch (e) { warn('populateProfiles failed:', e); }
 }
@@ -2681,6 +2754,7 @@ function syncSettingsForm() {
     set('cm_fold_user', s.foldUserPrompt);
     set('cm_wfold_user', s.worldFoldUserPrompt);
     syncSourcePanels();
+    populateProfiles();
 }
 
 function bindSettings() {
@@ -2732,6 +2806,10 @@ function bindSettings() {
     });
     $(document).on('change', '#cm_profile', function () {
         getSettings().profileId = $(this).val();
+        saveSettings();
+    });
+    $(document).on('change', '#cm_consult_profile', function () {
+        getSettings().consultProfileId = $(this).val();
         saveSettings();
     });
 }
