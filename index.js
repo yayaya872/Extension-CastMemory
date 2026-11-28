@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.6.1';
+const VERSION = '2.7.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -1483,6 +1483,7 @@ function onChatChanged() {
         lastInjected = { at: 0, text: '' };
         lastInjectedTokens = -1;
         lastRegisteredBlock = null; // ST wiped extension_prompts with the chat
+        consultDraft = null; // a draft distilled in another chat must not leak over
         clampStoreToChat();
         processNewBlocks();
         markAppliedMessages(); // ignore flags don't survive a reload — re-assert
@@ -1664,8 +1665,19 @@ Rules:
 - Write character profiles and location details from the story context provided. Use registered names exactly as they appear in the roster.
 - Do not write story prose or roleplay replies here; that belongs to the main chat.`;
 
+const CONSULT_DISTILL_PROMPT = `[Cast Memory — instruction distillation]
+Read the consultation between the player and the GM below (a story-state snapshot may follow) and write ONE self-contained GM instruction for the next reply of the main story.
+
+Rules:
+- Include only what the story model needs: what should happen next, how each involved character should act and feel, facts decided during the consultation, and constraints (what must NOT happen).
+- Reflect the final consensus, including corrections made along the way. Drop options that were considered and rejected.
+- Write direct instructions to the story model, in Japanese, compactly (short paragraphs or bullets).
+- Never mention the consultation, this window, or that anything was summarized. No preamble — output only the instruction text.`;
+
 let consultBusy = false;
 let consultMinimized = false;
+let consultDraft = null;     // distilled instruction awaiting confirmation
+let draftShownText = null;   // draft text currently rendered in the editor
 
 function buildConsultButton() {
     if (document.getElementById('cm-consult-float')) return;
@@ -1702,6 +1714,10 @@ function buildConsultPanel() {
                 <button type="button" data-cp="unarmed">取消</button>
             </div>
             <div class="cm-cp-msgs"></div>
+            <div class="cm-cp-actions" hidden>
+                <button type="button" data-cp="distill">📝 話し合いを指示にまとめて本編へ</button>
+            </div>
+            <div class="cm-cp-draft" hidden></div>
             <div class="cm-cp-inputrow">
                 <textarea class="cm-cp-input" rows="2" placeholder="展開の相談・指示・「〇〇を追加して」など"></textarea>
                 <button type="button" class="cm-cp-send">送信</button>
@@ -1826,24 +1842,41 @@ function renderConsult() {
         if (m.role === 'user') {
             return `<div class="cm-cp-msg cm-cp-user"><div class="cm-cp-bubble">${escapeHtml(m.text).replace(/\n/g, '<br>')}</div></div>`;
         }
-        return `<div class="cm-cp-msg cm-cp-assistant"><div class="cm-cp-bubble cm-md mes_text">${renderMd(m.text, '')}</div><button type="button" class="cm-cp-reflect" data-idx="${i}">本編に反映</button></div>`;
+        return `<div class="cm-cp-msg cm-cp-assistant"><div class="cm-cp-bubble cm-md mes_text">${renderMd(m.text, '')}</div></div>`;
     }).join('');
     msgs.scrollTop = wasAtBottom ? msgs.scrollHeight : prevTop;
+
+    // "Distill into an instruction" action: available once there is
+    // an actual exchange to summarize.
+    const actions = panel.querySelector('.cm-cp-actions');
+    if (actions && store) {
+        const hasExchange = store.consult.some(m => m.role === 'user')
+            && store.consult.some(m => m.role === 'assistant');
+        actions.hidden = !hasExchange || consultDraft !== null;
+    }
+    // Draft editor: rendered once per distilled text so re-renders
+    // (background updateUI) never clobber the user's edits.
+    const draftEl = panel.querySelector('.cm-cp-draft');
+    if (draftEl) {
+        if (consultDraft === null) {
+            draftEl.hidden = true;
+            draftEl.innerHTML = '';
+            draftShownText = null;
+        } else if (draftShownText !== consultDraft) {
+            draftShownText = consultDraft;
+            draftEl.hidden = false;
+            draftEl.innerHTML = `
+                <div class="cm-cp-draft-label">本編への指示（編集できます）</div>
+                <textarea class="cm-cp-draft-text" rows="5">${escapeHtml(consultDraft)}</textarea>
+                <div class="cm-cp-draft-btns">
+                    <button type="button" data-cp="draft-set">この内容でセット</button>
+                    <button type="button" data-cp="draft-cancel">やめる</button>
+                </div>`;
+        }
+    }
 }
 
 function onConsultPanelClick(e) {
-    const reflect = e.target.closest('.cm-cp-reflect');
-    if (reflect) {
-        const store = getStore();
-        const entry = store?.consult[Number(reflect.dataset.idx)];
-        if (store && entry && entry.role === 'assistant' && entry.text) {
-            store.pendingInstruction = entry.text;
-            saveStore();
-            renderConsult();
-            if (typeof toastr !== 'undefined') toastr.success('次の本編の生成にだけ、この指示が付きます。');
-        }
-        return;
-    }
     const btn = e.target.closest('[data-cp]');
     if (!btn) {
         if (e.target.closest('.cm-cp-send')) {
@@ -1856,6 +1889,24 @@ function onConsultPanelClick(e) {
         return;
     }
     const act = btn.dataset.cp;
+    if (act === 'distill') distillConsult();
+    if (act === 'draft-set') {
+        const store = getStore();
+        const ta = document.querySelector('#cm-consult-panel .cm-cp-draft-text');
+        const text = (ta?.value || '').trim();
+        if (store && text) {
+            store.pendingInstruction = text;
+            store.consult.push({ role: 'note', text: '📌 本編への指示をセットしました（次の生成にだけ付きます）', ts: Date.now() });
+            saveStore();
+            consultDraft = null;
+            renderConsult();
+            if (typeof toastr !== 'undefined') toastr.success('次の本編の生成にだけ、この指示が付きます。');
+        }
+    }
+    if (act === 'draft-cancel') {
+        consultDraft = null;
+        renderConsult();
+    }
     if (act === 'close') toggleConsultPanel(false);
     if (act === 'min') {
         consultMinimized = !consultMinimized;
@@ -1948,6 +1999,52 @@ async function consultGenerate(ctx, systemPrompt, turns, liveEl) {
     }
     const raw = await ctx.generateRaw({ systemPrompt, prompt: turns, responseLength: 1200 });
     return String(raw || '');
+}
+
+// Distills the whole consultation into a single self-contained GM
+// instruction and parks it in the draft editor for confirmation.
+async function distillConsult() {
+    if (consultBusy) return;
+    const panel = document.getElementById('cm-consult-panel');
+    const store = getStore();
+    if (!panel || !store) return;
+    const ctx = SillyTavern.getContext();
+    consultBusy = true;
+    const sendBtn = panel.querySelector('.cm-cp-send');
+    const canStop = !!getSettings().consultProfileId;
+    if (sendBtn) {
+        sendBtn.textContent = canStop ? '停止' : '…';
+        sendBtn.disabled = !canStop;
+    }
+    let liveEl = null;
+    const msgsEl = panel.querySelector('.cm-cp-msgs');
+    if (msgsEl) {
+        const wrap = document.createElement('div');
+        wrap.className = 'cm-cp-msg cm-cp-assistant';
+        wrap.innerHTML = '<div class="cm-cp-bubble cm-cp-live">…</div>';
+        msgsEl.appendChild(wrap);
+        liveEl = wrap.querySelector('.cm-cp-live');
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+    try {
+        const snapshot = await consultContextSnapshot(store);
+        const systemPrompt = snapshot ? `${CONSULT_DISTILL_PROMPT}\n\n${snapshot}` : CONSULT_DISTILL_PROMPT;
+        const turns = store.consult
+            .filter(m => m.role === 'user' || m.role === 'assistant')
+            .slice(-20)
+            .map(m => ({ role: m.role, content: m.text }));
+        const raw = await consultGenerate(ctx, systemPrompt, turns, liveEl);
+        const text = stripBlocks(cleanModelText(String(raw || '')));
+        if (!text) throw new Error('empty distillation');
+        consultDraft = text;
+    } catch (e) {
+        warn('consult distillation failed:', e);
+        if (typeof toastr !== 'undefined') toastr.error('指示へのまとめに失敗しました。');
+    } finally {
+        consultBusy = false;
+        if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = '送信'; }
+        renderConsult();
+    }
 }
 
 async function sendConsult() {

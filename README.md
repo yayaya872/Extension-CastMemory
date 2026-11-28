@@ -53,12 +53,14 @@ opens the consult window: an overlay side chat with the main model
 out of the story history. There you can discuss where the story
 goes, have the model fix Cast Memory data by emitting the same
 declaration blocks (e.g. register a character the story forgot), and
-arm any of its replies as a one-shot GM instruction that rides on
-your next main generation only. By default the consult window talks
-through the main connection (whole replies); if you pick a
-Connection Manager profile for it in the settings — the main
-model's own profile works as-is — its replies stream into the
-window live, with a stop button. The sheet has three tabs:
+arm a one-shot GM instruction for your next main generation:
+the "distill" button has the model compress the whole consultation
+into a single self-contained instruction (final consensus only,
+dropped ideas excluded), which you can edit before arming it. If
+you pick a Connection Manager profile for the consult window in
+the settings — the main model's own profile works as-is — its
+replies stream into the window live, with a stop button. The sheet
+has three tabs:
 
 - **Characters** — the roster; tap a character for their profile and
   memories, rendered as markdown. Profiles are editable; presence can
