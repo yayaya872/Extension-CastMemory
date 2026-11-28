@@ -47,7 +47,14 @@ with its own saved position: a round 🎭 button — its badge shows how
 many characters are on stage, and the mask turns into a spinner
 while the sub model is writing memories — and a chip showing only
 the current location's name. Tap the button to open the sheet; tap
-the chip to open it on the World tab. The sheet has three tabs:
+the chip to open it on the World tab. A third, smaller 💬 float
+opens the consult window: an overlay side chat with the main model
+(it sees the cast memory block and the recent story), kept entirely
+out of the story history. There you can discuss where the story
+goes, have the model fix Cast Memory data by emitting the same
+declaration blocks (e.g. register a character the story forgot), and
+arm any of its replies as a one-shot GM instruction that rides on
+your next main generation only. The sheet has three tabs:
 
 - **Characters** — the roster; tap a character for their profile and
   memories, rendered as markdown. Profiles are editable; presence can

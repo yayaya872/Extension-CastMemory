@@ -24,7 +24,7 @@
 
 const MODULE = 'cast_memory';
 const LOG_PREFIX = '[CastMemory]';
-const VERSION = '2.5.0';
+const VERSION = '2.6.0';
 
 function log(...args) { console.log(LOG_PREFIX, ...args); }
 function warn(...args) { console.warn(LOG_PREFIX, ...args); }
@@ -125,6 +125,10 @@ Condense this world memory into a shorter long-term record. Preserve: the curren
     iconTop: null,
     locIconLeft: null,
     locIconTop: null,
+    consultBtnLeft: null,
+    consultBtnTop: null,
+    consultPanelLeft: null,
+    consultPanelTop: null,
 });
 
 function getSettings() {
@@ -171,6 +175,8 @@ function emptyStore() {
         lastWrite: null,
         locations: {},
         currentLocation: '',
+        consult: [],            // side-window conversation {role, text, ts}
+        pendingInstruction: '', // one-shot GM instruction for the next main generation
     };
 }
 
@@ -188,6 +194,8 @@ function getStore() {
     if (store.lastWrite === undefined) store.lastWrite = null;
     if (!store.locations || typeof store.locations !== 'object') store.locations = {};
     if (typeof store.currentLocation !== 'string') store.currentLocation = '';
+    if (!Array.isArray(store.consult)) store.consult = [];
+    if (typeof store.pendingInstruction !== 'string') store.pendingInstruction = '';
     for (const loc of Object.values(store.locations)) {
         if (typeof loc.detail !== 'string') loc.detail = '';
     }
@@ -1387,6 +1395,23 @@ globalThis.castMemoryInterceptor = async function (chatArray, _contextSize, _abo
         if (type === 'quiet' || type === 'impersonate') return;
         const store = getStore();
         if (!store) return;
+        // One-shot GM instruction armed from the consult window: rides
+        // on this generation only, appended at the very end of the
+        // prompt, and never becomes a chat message.
+        if (store.pendingInstruction) {
+            const text = store.pendingInstruction;
+            store.pendingInstruction = '';
+            saveStore();
+            chatArray.push({
+                name: 'GM instruction',
+                is_user: false,
+                is_system: true,
+                send_date: Date.now(),
+                mes: `[GM instruction — applies to this reply only]\n${text}`,
+                extra: { type: 'narrator' },
+            });
+            setTimeout(updateUI, 50);
+        }
         if (s.injectionMethod === 'extension') {
             // The block rides as a registered extension prompt instead.
             lastGen.included = !!lastRegisteredBlock;
@@ -1489,6 +1514,8 @@ function buildFabAndSheet() {
     buildSheetContent();
     buildFloatButton();
     buildLocChip();
+    buildConsultButton();
+    buildConsultPanel();
 }
 
 // The button float and the location float are separate elements, each
@@ -1602,6 +1629,337 @@ function bindFloatDrag(el, keyL, keyT, onTap) {
         }
         onTap();
     });
+}
+
+// ─── Consult window (OOC side chat with the main model) ─────────────────────
+// A small overlay window, separate from the story chat: the player can
+// discuss the story's direction with the main model, have it fix Cast
+// Memory data by emitting declaration blocks, and arm a reply as a
+// one-shot GM instruction for the next main generation. Nothing here
+// ever becomes a story message.
+
+const CONSULT_SYSTEM_PROMPT = `[Cast Memory — consultation mode]
+You are the same model that writes the main story, now talking out of character with the player in a side window. The story itself is NOT advancing here. A snapshot of the current story state (the cast memory block and the recent messages) follows in the next system message; treat it as ground truth about the story so far.
+
+Rules:
+- Reply in Japanese, in a relaxed out-of-character tone. Be concise and concrete.
+- When the player asks for a story directive (what should happen next, how a character should act), state it as one clear, self-contained instruction that could be handed to the story as-is.
+- When the player asks you to register or fix Cast Memory data (a character that was never added, a wrong current location, someone who should be on/off stage, a rename), output the declaration blocks below — exactly in these formats — in addition to a short confirmation in prose. The extension applies the blocks immediately. Never output blocks unless the player asked for a data change.
+  - Enter stage: <!-- castmemory: login NAME -->
+  - Leave stage: <!-- castmemory: logout NAME -->
+  - Character profile: <!-- castmemory character start
+    Name: NAME
+    (profile in markdown: who they are, appearance, personality, relationship to the player character)
+    castmemory character end -->
+  - Location: <!-- castmemory location start
+    Name: NAME
+    (what the place is like)
+    castmemory location end -->
+  - Set current location: <!-- castmemory: here NAME -->
+  - Rename: <!-- castmemory: rename OLD -> NEW -->
+  - World setting (concept / premise only, never place details): <!-- castmemory world start
+    (text)
+    castmemory world end -->
+- Write character profiles and location details from the story context provided. Use registered names exactly as they appear in the roster.
+- Do not write story prose or roleplay replies here; that belongs to the main chat.`;
+
+let consultBusy = false;
+let consultMinimized = false;
+
+function buildConsultButton() {
+    if (document.getElementById('cm-consult-float')) return;
+    const el = document.createElement('div');
+    el.id = 'cm-consult-float';
+    el.style.cssText = floatBaseStyle();
+    el.innerHTML = `
+        <button class="cm-fab cm-fab-sub" type="button" title="相談窓を開く">
+            <span class="cm-fab-face">💬</span>
+            <span class="cm-fab-badge cm-cb-badge" hidden>📌</span>
+        </button>`;
+    document.body.appendChild(el);
+    applyFloatPosition(el, 'consultBtnLeft', 'consultBtnTop', 10, 116);
+    bindFloatDrag(el, 'consultBtnLeft', 'consultBtnTop', () => toggleConsultPanel());
+}
+
+function buildConsultPanel() {
+    if (document.getElementById('cm-consult-panel')) return;
+    const el = document.createElement('div');
+    el.id = 'cm-consult-panel';
+    el.hidden = true;
+    el.innerHTML = `
+        <div class="cm-cp-head">
+            <span class="cm-cp-title">💬 相談</span>
+            <span class="cm-cp-btns">
+                <button type="button" data-cp="clear" title="相談履歴を消去">🗑</button>
+                <button type="button" data-cp="min" title="最小化">―</button>
+                <button type="button" data-cp="close" title="閉じる">✕</button>
+            </span>
+        </div>
+        <div class="cm-cp-body">
+            <div class="cm-cp-banner" hidden>
+                <span class="cm-cp-banner-text"></span>
+                <button type="button" data-cp="unarmed">取消</button>
+            </div>
+            <div class="cm-cp-msgs"></div>
+            <div class="cm-cp-inputrow">
+                <textarea class="cm-cp-input" rows="2" placeholder="展開の相談・指示・「〇〇を追加して」など"></textarea>
+                <button type="button" class="cm-cp-send">送信</button>
+            </div>
+        </div>`;
+    document.body.appendChild(el);
+    applyConsultPanelPosition(el);
+    bindConsultPanelDrag(el);
+    el.addEventListener('click', onConsultPanelClick);
+    el.querySelector('.cm-cp-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendConsult();
+        }
+    });
+}
+
+function applyConsultPanelPosition(el) {
+    const s = getSettings();
+    const w = Math.min(window.innerWidth * 0.88, 360);
+    let left = Number.isFinite(s.consultPanelLeft) ? s.consultPanelLeft : Math.max(6, window.innerWidth - w - 10);
+    let top = Number.isFinite(s.consultPanelTop) ? s.consultPanelTop : 54;
+    left = Math.min(Math.max(0, left), Math.max(0, window.innerWidth - 60));
+    top = Math.min(Math.max(0, top), Math.max(0, window.innerHeight - 60));
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+}
+
+function bindConsultPanelDrag(el) {
+    const head = el.querySelector('.cm-cp-head');
+    let startX = 0, startY = 0, origLeft = 0, origTop = 0, dragging = false, moved = false, captured = false;
+    head.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button')) return;
+        const rect = el.getBoundingClientRect();
+        startX = e.clientX; startY = e.clientY;
+        origLeft = rect.left; origTop = rect.top;
+        dragging = true; moved = false; captured = false;
+    });
+    head.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX, dy = e.clientY - startY;
+        if (Math.abs(dx) + Math.abs(dy) > 6) moved = true;
+        if (!moved) return;
+        if (!captured) {
+            try { head.setPointerCapture(e.pointerId); } catch (err) { /* noop */ }
+            captured = true;
+        }
+        e.preventDefault();
+        const left = Math.min(Math.max(0, origLeft + dx), window.innerWidth - 60);
+        const top = Math.min(Math.max(0, origTop + dy), window.innerHeight - 40);
+        el.style.left = `${left}px`;
+        el.style.top = `${top}px`;
+    });
+    head.addEventListener('pointerup', () => {
+        if (!dragging) return;
+        dragging = false;
+        if (moved) {
+            const rect = el.getBoundingClientRect();
+            const s = getSettings();
+            s.consultPanelLeft = Math.round(rect.left);
+            s.consultPanelTop = Math.round(rect.top);
+            saveSettings();
+        }
+    });
+}
+
+function toggleConsultPanel(force) {
+    const el = document.getElementById('cm-consult-panel');
+    if (!el) return;
+    const show = typeof force === 'boolean' ? force : el.hidden;
+    el.hidden = !show;
+    if (show) renderConsult();
+}
+
+function describeBlock(block) {
+    switch (block.kind) {
+        case 'login': return `「${block.name}」を登場させました`;
+        case 'logout': return `「${block.name}」を退場させました`;
+        case 'character': return `キャラクター「${block.name}」を登録しました`;
+        case 'location': return `場所「${block.name}」を登録しました`;
+        case 'here': return `現在地を「${block.name}」にしました`;
+        case 'rename': return `「${block.name}」を「${block.newName}」に改名しました`;
+        case 'world': return 'ワールド情報を追加しました';
+        default: return 'データを更新しました';
+    }
+}
+
+function renderConsult() {
+    const panel = document.getElementById('cm-consult-panel');
+    if (!panel) return;
+    const store = getStore();
+    const msgs = panel.querySelector('.cm-cp-msgs');
+    const banner = panel.querySelector('.cm-cp-banner');
+    const s = getSettings();
+    panel.style.opacity = s.enabled ? '1' : '0.5';
+
+    if (banner && store) {
+        const armed = !!store.pendingInstruction;
+        banner.hidden = !armed;
+        if (armed) {
+            const t = banner.querySelector('.cm-cp-banner-text');
+            const preview = store.pendingInstruction.length > 60
+                ? `${store.pendingInstruction.slice(0, 60)}…`
+                : store.pendingInstruction;
+            if (t) t.textContent = `📌 次の本編に反映：${preview}`;
+        }
+    }
+    const badge = document.querySelector('.cm-cb-badge');
+    if (badge) badge.hidden = !(store && store.pendingInstruction);
+
+    if (!msgs) return;
+    const prevTop = msgs.scrollTop;
+    const wasAtBottom = msgs.scrollHeight - prevTop - msgs.clientHeight < 60;
+    if (!store || store.consult.length === 0) {
+        msgs.innerHTML = '<div class="cm-cp-empty">展開の相談、本編への指示、キャラクター追加漏れの修正などをここで話せます。本編の履歴には混ざりません。</div>';
+        return;
+    }
+    msgs.innerHTML = store.consult.map((m, i) => {
+        if (m.role === 'note') {
+            return `<div class="cm-cp-note">${escapeHtml(m.text)}</div>`;
+        }
+        if (m.role === 'user') {
+            return `<div class="cm-cp-msg cm-cp-user"><div class="cm-cp-bubble">${escapeHtml(m.text).replace(/\n/g, '<br>')}</div></div>`;
+        }
+        return `<div class="cm-cp-msg cm-cp-assistant"><div class="cm-cp-bubble cm-md mes_text">${renderMd(m.text, '')}</div><button type="button" class="cm-cp-reflect" data-idx="${i}">本編に反映</button></div>`;
+    }).join('');
+    msgs.scrollTop = wasAtBottom ? msgs.scrollHeight : prevTop;
+}
+
+function onConsultPanelClick(e) {
+    const reflect = e.target.closest('.cm-cp-reflect');
+    if (reflect) {
+        const store = getStore();
+        const entry = store?.consult[Number(reflect.dataset.idx)];
+        if (store && entry && entry.role === 'assistant' && entry.text) {
+            store.pendingInstruction = entry.text;
+            saveStore();
+            renderConsult();
+            if (typeof toastr !== 'undefined') toastr.success('次の本編の生成にだけ、この指示が付きます。');
+        }
+        return;
+    }
+    const btn = e.target.closest('[data-cp]');
+    if (!btn) {
+        if (e.target.closest('.cm-cp-send')) sendConsult();
+        return;
+    }
+    const act = btn.dataset.cp;
+    if (act === 'close') toggleConsultPanel(false);
+    if (act === 'min') {
+        consultMinimized = !consultMinimized;
+        const body = document.querySelector('#cm-consult-panel .cm-cp-body');
+        if (body) body.hidden = consultMinimized;
+        btn.textContent = consultMinimized ? '＋' : '―';
+    }
+    if (act === 'unarmed') {
+        const store = getStore();
+        if (store) {
+            store.pendingInstruction = '';
+            saveStore();
+            renderConsult();
+        }
+    }
+    if (act === 'clear') {
+        const store = getStore();
+        if (store && store.consult.length && window.confirm('相談履歴を消去しますか？')) {
+            store.consult = [];
+            saveStore();
+            renderConsult();
+        }
+    }
+}
+
+async function consultContextSnapshot(store) {
+    const s = getSettings();
+    const parts = [];
+    try {
+        const block = await assembleBlock(store, s.memoryBudgetTokens + 800);
+        if (block) parts.push(`[Current cast memory state]\n${block}`);
+    } catch (e) { /* context is best-effort */ }
+    try {
+        const { chat, name1 } = SillyTavern.getContext();
+        if (Array.isArray(chat)) {
+            const tail = chat.filter(m => m && m.mes && !m.is_system).slice(-12);
+            if (tail.length) {
+                const lines = tail.map(m => {
+                    const name = m.name || (m.is_user ? name1 : '');
+                    const text = String(m.mes).slice(0, 1000);
+                    return `${name}: ${text}`;
+                });
+                parts.push(`[Recent story messages]\n${lines.join('\n')}`);
+            }
+        }
+    } catch (e) { /* best-effort */ }
+    return parts.join('\n\n');
+}
+
+async function sendConsult() {
+    if (consultBusy) return;
+    const panel = document.getElementById('cm-consult-panel');
+    const input = panel?.querySelector('.cm-cp-input');
+    const text = (input?.value || '').trim();
+    if (!text) return;
+    const store = getStore();
+    if (!store) return;
+    const ctx = SillyTavern.getContext();
+    if (typeof ctx.generateRaw !== 'function') {
+        if (typeof toastr !== 'undefined') toastr.error('このSillyTavernでは相談窓の生成APIが使えません。');
+        return;
+    }
+    if (input) input.value = '';
+    store.consult.push({ role: 'user', text, ts: Date.now() });
+    saveStore();
+    renderConsult();
+
+    consultBusy = true;
+    const sendBtn = panel.querySelector('.cm-cp-send');
+    if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '…'; }
+    try {
+        const snapshot = await consultContextSnapshot(store);
+        const systemPrompt = snapshot ? `${CONSULT_SYSTEM_PROMPT}\n\n${snapshot}` : CONSULT_SYSTEM_PROMPT;
+        const turns = store.consult
+            .filter(m => m.role === 'user' || m.role === 'assistant')
+            .slice(-20)
+            .map(m => ({ role: m.role, content: m.text }));
+        const raw = await ctx.generateRaw({ systemPrompt, prompt: turns, responseLength: 1200 });
+        const reply = cleanModelText(String(raw || ''));
+        if (!reply) throw new Error('empty reply');
+
+        // Declaration blocks in the reply are data operations: apply
+        // them to the store right away and keep them out of the prose.
+        const blocks = parseBlocks(reply);
+        const applied = [];
+        if (blocks.length) {
+            const { chat } = ctx;
+            const idx = Array.isArray(chat) ? chat.length - 1 : 0;
+            for (const b of blocks) {
+                if (applyBlock(store, b, idx)) applied.push(describeBlock(b));
+            }
+        }
+        const prose = stripBlocks(reply);
+        if (prose) store.consult.push({ role: 'assistant', text: prose, ts: Date.now() });
+        if (applied.length) {
+            store.consult.push({ role: 'note', text: `✅ ${applied.join('／')}`, ts: Date.now() });
+        }
+        if (!prose && !applied.length) {
+            store.consult.push({ role: 'note', text: '（返答が空でした）', ts: Date.now() });
+        }
+        saveStore();
+        updateUI();
+    } catch (e) {
+        warn('consult generation failed:', e);
+        store.consult.push({ role: 'note', text: '⚠️ 生成に失敗しました。接続を確認して、もう一度送ってみてください。', ts: Date.now() });
+        saveStore();
+    } finally {
+        consultBusy = false;
+        if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = '送信'; }
+        renderConsult();
+    }
 }
 
 function buildWandMenuEntry() {
@@ -2258,6 +2616,7 @@ function updateUI() {
     try {
         updateFloat();
         if (cmSheetEl) renderSheet();
+        if (document.getElementById('cm-consult-panel')) renderConsult();
         const panelStatus = document.getElementById('cm_status');
         if (panelStatus) panelStatus.textContent = statusText();
     } catch (e) { /* UI is best-effort */ }
@@ -2400,7 +2759,8 @@ function initCastMemory() {
         let cmWatchTries = 0;
         const cmWatch = setInterval(() => {
             cmWatchTries++;
-            if (!document.getElementById("cm-float") || !document.getElementById("cm-loc-float")) {
+            if (!document.getElementById("cm-float") || !document.getElementById("cm-loc-float")
+                || !document.getElementById("cm-consult-float") || !document.getElementById("cm-consult-panel")) {
                 try { buildFabAndSheet(); } catch (e) { noteError('watchdog/buildFabAndSheet', e); }
             }
             if (!document.getElementById('cm-wand-entry')) {
@@ -2436,6 +2796,7 @@ if (typeof module !== 'undefined' && module.exports) {
         cleanModelText, assembleBlock, writeMemoriesForRange, advanceApplied,
         matchCharacterName, normalizeName, extractJsonCandidates, repairJsonStrings,
         rewindLastWrite, unwrapBodyText, renameCharacter, getLocation, locationNames, matchLocationName,
+        describeBlock,
         countTextsTotal, ghostTarget, ghostAllNow, refreshExtensionPrompt,
         getTokenCountSource: () => tokenCountSource,
         resetTokenCounterState: () => { tokenFailUntil = 0; tokenCountSource = 'server'; },
